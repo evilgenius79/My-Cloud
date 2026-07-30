@@ -1,0 +1,126 @@
+import fs from 'fs';
+import fsp from 'fs/promises';
+import path from 'path';
+
+// Resolve a client-supplied relative path inside a root, refusing traversal.
+// Returns the absolute path or throws.
+export function safeJoin(root, relPath) {
+  const rel = String(relPath || '').replace(/\\/g, '/');
+  const resolved = path.resolve(root, '.' + path.posix.sep + rel);
+  const rootResolved = path.resolve(root);
+  if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
+    const err = new Error('Invalid path.');
+    err.status = 400;
+    throw err;
+  }
+  return resolved;
+}
+
+export function validName(name) {
+  if (typeof name !== 'string' || name.length === 0 || name.length > 255) return false;
+  if (name === '.' || name === '..') return false;
+  if (name.includes('/') || name.includes('\\')) return false;
+  for (const ch of name) {
+    if (ch.charCodeAt(0) < 32) return false;
+  }
+  return true;
+}
+
+export async function statEntry(abs, name) {
+  const st = await fsp.stat(abs);
+  return {
+    name,
+    isDir: st.isDirectory(),
+    size: st.isDirectory() ? 0 : st.size,
+    mtime: st.mtimeMs
+  };
+}
+
+export async function listDir(abs) {
+  const names = await fsp.readdir(abs);
+  const entries = [];
+  for (const name of names) {
+    try {
+      entries.push(await statEntry(path.join(abs, name), name));
+    } catch {
+      // Skip entries that vanish or can't be stat'd mid-listing.
+    }
+  }
+  return entries;
+}
+
+export async function dirSize(abs) {
+  let total = 0;
+  let entries;
+  try {
+    entries = await fsp.readdir(abs, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    const p = path.join(abs, e.name);
+    if (e.isDirectory()) total += await dirSize(p);
+    else if (e.isFile()) {
+      try {
+        total += (await fsp.stat(p)).size;
+      } catch { /* vanished */ }
+    }
+  }
+  return total;
+}
+
+// "photo.jpg" -> "photo (1).jpg" until the name is free in dir.
+export function uniqueName(dir, name) {
+  if (!fs.existsSync(path.join(dir, name))) return name;
+  const ext = path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  for (let i = 1; i < 10000; i++) {
+    const candidate = `${base} (${i})${ext}`;
+    if (!fs.existsSync(path.join(dir, candidate))) return candidate;
+  }
+  throw new Error('Could not find a unique name.');
+}
+
+export async function copyRecursive(src, dest) {
+  await fsp.cp(src, dest, { recursive: true, errorOnExist: true, force: false });
+}
+
+export async function moveEntry(src, dest) {
+  try {
+    await fsp.rename(src, dest);
+  } catch (err) {
+    if (err.code === 'EXDEV') {
+      // Cross-device (e.g. trash on another mount): copy then delete.
+      await fsp.cp(src, dest, { recursive: true });
+      await fsp.rm(src, { recursive: true, force: true });
+    } else {
+      throw err;
+    }
+  }
+}
+
+export async function searchFiles(root, query, limit = 200) {
+  const q = query.toLowerCase();
+  const results = [];
+  async function walk(dir, rel) {
+    if (results.length >= limit) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (results.length >= limit) return;
+      const childRel = rel ? rel + '/' + e.name : e.name;
+      if (e.name.toLowerCase().includes(q)) {
+        try {
+          results.push({ path: childRel, ...(await statEntry(path.join(dir, e.name), e.name)) });
+        } catch { /* vanished */ }
+      }
+      if (e.isDirectory()) await walk(path.join(dir, e.name), childRel);
+    }
+  }
+  await walk(root, '');
+  return results;
+}

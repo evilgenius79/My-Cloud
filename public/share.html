@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared with you</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234f8ff7' d='M6.5 20a5.5 5.5 0 0 1-.44-10.98A7 7 0 0 1 19.5 11a4.5 4.5 0 0 1-.5 8.97z'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="share-page">
+  <!-- Password gate -->
+  <div id="lock-screen" class="auth-screen hidden" style="height:70vh">
+    <div class="auth-card">
+      <div class="auth-logo">🔒</div>
+      <h1>Password required</h1>
+      <p class="muted">This share is protected.</p>
+      <form id="lock-form">
+        <input id="lock-password" type="password" placeholder="Password" required>
+        <div id="lock-error" class="form-error hidden"></div>
+        <button type="submit" class="btn primary wide">Unlock</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Content -->
+  <div id="share-content" class="hidden">
+    <div class="share-head">
+      <span class="big-icon" id="share-icon">📄</span>
+      <div style="flex:1;min-width:0">
+        <h1 id="share-name" style="font-size:22px;overflow-wrap:anywhere"></h1>
+        <p id="share-meta" class="muted" style="margin:4px 0 0"></p>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button id="btn-share-upload" class="btn hidden">⬆ Upload</button>
+        <input id="share-file-input" type="file" multiple class="hidden">
+        <a id="btn-share-download" class="btn primary" style="text-decoration:none">⬇ Download</a>
+      </div>
+    </div>
+    <div id="share-breadcrumbs" class="breadcrumbs hidden" style="margin-bottom:8px"></div>
+    <div id="share-list" class="file-list list-mode card" style="padding:6px"></div>
+    <div id="share-preview-inline" style="margin-top:16px;text-align:center"></div>
+  </div>
+
+  <div id="share-error" class="empty-state hidden">
+    <div class="empty-icon">🚫</div>
+    <p id="share-error-text">This share does not exist or has expired.</p>
+  </div>
+
+  <p class="muted" style="text-align:center;margin-top:40px;font-size:13px">Shared via My Cloud ☁️</p>
+</div>
+<div id="toasts" class="toasts"></div>
+<script src="/share.js"></script>
+</body>
+</html>

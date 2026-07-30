@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>My-Cloud</Name>
+  <Repository>ghcr.io/evilgenius79/my-cloud:latest</Repository>
+  <Registry>https://ghcr.io/evilgenius79/my-cloud</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/evilgenius79/My-Cloud/issues</Support>
+  <Project>https://github.com/evilgenius79/My-Cloud</Project>
+  <Overview>My Cloud is a lightweight file sharing platform in the spirit of Nextcloud/ownCloud, but with zero database setup. Multi-user accounts, a fast web file browser with previews, drag-and-drop uploads, public share links with passwords and expiry, a trash bin, and quotas - all stored as simple JSON files. Perfect for home users who don't have a ton of files and don't want to babysit a database.</Overview>
+  <Category>Cloud: Productivity: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8686]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/evilgenius79/My-Cloud/main/public/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Lightweight, database-free file sharing platform. On first launch, open the WebUI to create your admin account. User files are stored under the Data path at users/&lt;username&gt;/files, so they stay plain files on your array - browsable from any Unraid share tool.</Description>
+  <Config Name="WebUI Port" Target="8686" Default="8686" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8686</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/my-cloud" Mode="rw" Description="App settings, users and share links (small JSON files)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/my-cloud</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/my-cloud" Mode="rw" Description="Where user files are stored (users/&lt;username&gt;/files)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/my-cloud</Config>
+</Container>

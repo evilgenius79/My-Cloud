@@ -1,0 +1,12 @@
+services:
+  my-cloud:
+    build: .
+    container_name: my-cloud
+    ports:
+      - "8686:8686"
+    volumes:
+      # App settings, users, shares (tiny JSON files)
+      - ./config:/config
+      # Your files live here: /data/users/<username>/files
+      - ./data:/data
+    restart: unless-stopped
