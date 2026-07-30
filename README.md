@@ -23,7 +23,12 @@ Everything is stored as plain files:
 
 ## Quick start (Unraid)
 
-1. Copy `templates/my-cloud.xml` into `/boot/config/plugins/dockerMan/templates-user/` (or add the container manually with the same settings), or install from Community Applications once published.
+1. Copy `templates/my-cloud.xml` into `/boot/config/plugins/dockerMan/templates-user/` — save it as `my-My-Cloud.xml` (Unraid strips the `my-` filename prefix to label user templates in the Add Container dropdown). Or install from Community Applications once published.
+
+   ```bash
+   wget -O /boot/config/plugins/dockerMan/templates-user/my-My-Cloud.xml \
+     https://raw.githubusercontent.com/evilgenius79/My-Cloud/main/templates/my-cloud.xml
+   ```
 2. Map:
    - **`/config`** → `/mnt/user/appdata/my-cloud` (settings, users, shares)
    - **`/data`** → `/mnt/user/my-cloud` (where user files live)
