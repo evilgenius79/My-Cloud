@@ -8,6 +8,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/evilgenius79/My-Cloud/issues</Support>
   <Project>https://github.com/evilgenius79/My-Cloud</Project>
+  <TemplateURL>https://raw.githubusercontent.com/evilgenius79/My-Cloud/main/templates/my-cloud.xml</TemplateURL>
   <Overview>My Cloud is a lightweight file sharing platform in the spirit of Nextcloud/ownCloud, but with zero database setup. Multi-user accounts, a fast web file browser with previews, drag-and-drop uploads, public share links with passwords and expiry, a trash bin, and quotas - all stored as simple JSON files. Perfect for home users who don't have a ton of files and don't want to babysit a database.</Overview>
   <Category>Cloud: Productivity: Tools:</Category>
   <WebUI>http://[IP]:[PORT:8686]/</WebUI>

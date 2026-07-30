@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<CommunityApplications>
+  <Profile>
+**My Cloud** — a lightweight, self-hosted file sharing platform in the spirit of Nextcloud/ownCloud, but with **zero database setup**. Multi-user accounts, a fast web file browser with previews and drag-and-drop uploads, public share links with passwords and expiry, a trash bin, and quotas — all stored as simple JSON files, with your files kept as plain files on the array.
+
+Support is provided through [GitHub issues](https://github.com/evilgenius79/My-Cloud/issues).
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/evilgenius79/My-Cloud/main/public/icon.png</Icon>
+  <WebPage>https://github.com/evilgenius79/My-Cloud</WebPage>
+</CommunityApplications>

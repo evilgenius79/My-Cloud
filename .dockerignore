@@ -4,6 +4,7 @@ dev-data
 config
 data
 .git
-unraid
+templates
+ca_profile.xml
 *.md
 docker-compose.yml
