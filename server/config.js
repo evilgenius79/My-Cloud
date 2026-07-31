@@ -33,7 +33,8 @@ const defaultSettings = {
   allowSignup: false,
   defaultQuotaMB: 0, // 0 = unlimited
   sessionDays: 30,
-  trashRetentionDays: 30
+  trashRetentionDays: 30,
+  allowPublicShares: true // admin can turn off public share links entirely
 };
 let settings = { ...defaultSettings };
 if (fs.existsSync(settingsFile)) {

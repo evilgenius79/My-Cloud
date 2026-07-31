@@ -4,6 +4,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import bcrypt from 'bcryptjs';
 import { JsonStore } from './store.js';
+import { settings } from './config.js';
 import { userDirs, authMiddleware, findUser } from './auth.js';
 import { safeJoin, listDir, realContained } from './fsutil.js';
 import { withLock } from './locks.js';
@@ -51,6 +52,9 @@ sharesRouter.get('/', (req, res) => {
 });
 
 sharesRouter.post('/', wrap(async (req, res) => {
+  if (!settings.allowPublicShares) {
+    return res.status(403).json({ error: 'Public share links are disabled by the administrator.' });
+  }
   const { path: sharePath, password, expiresDays, allowUpload } = req.body;
   const abs = safeJoin(userDirs(req.user.username).files, sharePath);
   const st = await fsp.stat(abs).catch(() => null);

@@ -66,7 +66,8 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
     username: req.user.username,
     isAdmin: req.user.isAdmin,
     quotaMB: req.user.quotaMB || 0,
-    siteName: settings.siteName
+    siteName: settings.siteName,
+    allowPublicShares: settings.allowPublicShares !== false
   });
 });
 
@@ -172,6 +173,7 @@ admin.patch('/settings', (req, res) => {
   // future and wipe all trash; a negative quota would reject every upload.
   if (req.body.defaultQuotaMB !== undefined) patch.defaultQuotaMB = clampNonNeg(req.body.defaultQuotaMB);
   if (req.body.trashRetentionDays !== undefined) patch.trashRetentionDays = clampNonNeg(req.body.trashRetentionDays);
+  if (req.body.allowPublicShares !== undefined) patch.allowPublicShares = !!req.body.allowPublicShares;
   res.json({ settings: saveSettings(patch) });
 });
 

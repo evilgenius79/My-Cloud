@@ -365,7 +365,7 @@ function showContextMenu(x, y, entry) {
     if (entry.isDir) add('📂 Open', () => openEntry(entry));
     else if (previewKind(entry.name)) add('👁 Preview', () => openPreview(entry));
     add('⬇ Download', () => downloadSelection());
-    add('🔗 Share…', () => shareDialog(joinPath(state.path, entry.name)));
+    if (state.user?.allowPublicShares) add('🔗 Share…', () => shareDialog(joinPath(state.path, entry.name)));
     sep();
     add('✏️ Rename…', () => renameDialog(entry));
   } else {
@@ -1082,6 +1082,7 @@ async function loadAdmin() {
     $('set-sitename').value = settingsData.settings.siteName;
     $('set-quota').value = settingsData.settings.defaultQuotaMB;
     $('set-trash').value = settingsData.settings.trashRetentionDays;
+    $('set-shares').checked = settingsData.settings.allowPublicShares !== false;
   } catch (err) {
     toast(err.message, true);
   }
@@ -1178,7 +1179,8 @@ $('settings-form').addEventListener('submit', async e => {
       body: {
         siteName: $('set-sitename').value,
         defaultQuotaMB: $('set-quota').value,
-        trashRetentionDays: $('set-trash').value
+        trashRetentionDays: $('set-trash').value,
+        allowPublicShares: $('set-shares').checked
       }
     });
     toast('Settings saved');
@@ -1243,6 +1245,11 @@ $('btn-account').addEventListener('click', () => {
     }
   ]);
 });
+
+// ---------- PWA service worker ----------
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
 
 // ---------- Boot ----------
 (async function boot() {

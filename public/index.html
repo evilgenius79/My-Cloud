@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My Cloud</title>
+<meta name="theme-color" content="#12151c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="My Cloud">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <script>try { var t = localStorage.getItem('mycloud_theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234f8ff7' d='M6.5 20a5.5 5.5 0 0 1-.44-10.98A7 7 0 0 1 19.5 11a4.5 4.5 0 0 1-.5 8.97z'/%3E%3C/svg%3E">
@@ -121,6 +126,7 @@
               <label>Site name <input id="set-sitename" type="text" maxlength="60"></label>
               <label>Default quota for new users (MB, 0 = unlimited) <input id="set-quota" type="number" min="0"></label>
               <label>Trash retention (days, 0 = keep forever) <input id="set-trash" type="number" min="0"></label>
+              <label class="check" style="flex-direction:row;align-items:center"><input id="set-shares" type="checkbox" style="width:auto"> Allow users to create public share links</label>
               <button class="btn primary sm" type="submit">Save settings</button>
             </form>
           </div>
