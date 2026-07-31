@@ -80,7 +80,8 @@ export function sendFile(req, res, abs, { download = false, name = null } = {}) 
 let activeZips = 0;
 const MAX_ACTIVE_ZIPS = 4;
 
-export function sendZip(res, abs, zipName, { level = 1 } = {}) {
+// Stream a zip built by `build(archive)`. Enforces the concurrency cap.
+function streamArchive(res, zipName, level, build) {
   if (activeZips >= MAX_ACTIVE_ZIPS) {
     res.setHeader('Retry-After', '5');
     return res.status(503).json({ error: 'Server busy compressing other downloads. Try again shortly.' });
@@ -95,8 +96,22 @@ export function sendZip(res, abs, zipName, { level = 1 } = {}) {
   archive.on('end', done);
   res.on('close', done);
   archive.pipe(res);
-  archive.directory(abs, path.basename(abs));
+  build(archive);
   archive.finalize();
+}
+
+export function sendZip(res, abs, zipName, { level = 1 } = {}) {
+  streamArchive(res, zipName, level, a => a.directory(abs, path.basename(abs)));
+}
+
+// Zip a list of { abs, name, isDir } entries (for multi-item shares/selections).
+export function sendZipItems(res, items, zipName, { level = 1 } = {}) {
+  streamArchive(res, zipName, level, a => {
+    for (const it of items) {
+      if (it.isDir) a.directory(it.abs, it.name);
+      else a.file(it.abs, { name: it.name });
+    }
+  });
 }
 
 filesRouter.get('/list', wrap(async (req, res) => {

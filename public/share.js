@@ -86,7 +86,13 @@ function renderShare() {
   $('share-name').textContent = shareInfo.name;
   document.title = shareInfo.name + ' — Shared with you';
 
-  if (shareInfo.isDir) {
+  if (shareInfo.isMulti) {
+    $('share-icon').textContent = '🗂️';
+    $('share-meta').textContent = 'Shared items';
+    $('btn-share-download').href = base + '/download';
+    $('btn-share-download').textContent = '⬇ Download all (.zip)';
+    loadMulti();
+  } else if (shareInfo.isDir) {
     $('share-icon').textContent = '📁';
     $('share-meta').textContent = 'Shared folder';
     $('btn-share-download').href = dlUrl(currentPath, false);
@@ -132,6 +138,48 @@ function renderInlinePreview(name, url) {
     f.style.border = 'none';
     f.style.borderRadius = '10px';
     box.appendChild(f);
+  }
+}
+
+async function loadMulti() {
+  const res = await fetch(base + '/list');
+  if (!res.ok) return toast('Could not load items.', true);
+  const data = await res.json();
+  const entries = data.entries.sort((a, b) =>
+    (b.isDir - a.isDir) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const list = $('share-list');
+  list.innerHTML = '';
+  $('share-preview-inline').innerHTML = '';
+  for (const e of entries) {
+    const el = document.createElement('div');
+    el.className = 'entry';
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+    thumb.textContent = iconFor(e);
+    const name = document.createElement('div');
+    name.className = 'ename';
+    name.textContent = e.name;
+    const meta = document.createElement('div');
+    meta.className = 'emeta';
+    meta.textContent = e.isDir ? 'Folder' : fmtSize(e.size);
+    const dl = document.createElement('a');
+    dl.className = 'btn sm';
+    dl.textContent = '⬇';
+    dl.style.textDecoration = 'none';
+    const itemUrl = base + '/download?i=' + e.i;
+    dl.href = itemUrl;
+    dl.addEventListener('click', ev => ev.stopPropagation());
+    el.append(thumb, name, meta, dl);
+    el.addEventListener('click', () => {
+      const ext = extOf(e.name);
+      if (!e.isDir && (IMG_EXT.has(ext) || VID_EXT.has(ext) || AUD_EXT.has(ext) || ext === 'pdf')) {
+        renderInlinePreview(e.name, itemUrl + '&dl=0');
+        $('share-preview-inline').scrollIntoView({ behavior: 'smooth' });
+      } else {
+        window.location.href = itemUrl;
+      }
+    });
+    list.appendChild(el);
   }
 }
 

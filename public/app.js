@@ -384,6 +384,7 @@ function showContextMenu(x, y, entry) {
     add('✏️ Rename…', () => renameDialog(entry));
   } else {
     add('⬇ Download as zip', () => downloadSelection());
+    if (state.user?.allowPublicShares) add('🔗 Share…', () => shareDialog(selectedPaths()));
   }
   add('📦 Move to…', () => movePickerDialog('move'));
   add('📋 Copy to…', () => movePickerDialog('copy'));
@@ -588,7 +589,9 @@ async function movePickerDialog(mode) {
 }
 
 // ---------- Share dialog ----------
-function shareDialog(path) {
+// target: a single path string, or an array of paths for a multi-item share.
+function shareDialog(target) {
+  const multi = Array.isArray(target);
   const pw = document.createElement('input');
   pw.type = 'password';
   pw.placeholder = 'Optional password';
@@ -596,26 +599,30 @@ function shareDialog(path) {
   const exp = document.createElement('select');
   exp.innerHTML = '<option value="">Never expires</option><option value="1">1 day</option>' +
     '<option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option>';
-  const upWrap = document.createElement('label');
-  upWrap.className = 'check';
+  const wrap = document.createElement('div');
+  wrap.append(fieldEl('Password protection', pw), fieldEl('Expires', exp));
+
   const upCheck = document.createElement('input');
   upCheck.type = 'checkbox';
-  upWrap.append(upCheck, document.createTextNode('Allow visitors to upload (folders only)'));
+  if (!multi) {
+    const upWrap = document.createElement('label');
+    upWrap.className = 'check';
+    upWrap.append(upCheck, document.createTextNode('Allow visitors to upload (folders only)'));
+    wrap.appendChild(upWrap);
+  }
 
-  const wrap = document.createElement('div');
-  wrap.append(fieldEl('Password protection', pw), fieldEl('Expires', exp), upWrap);
-
-  openModal('Share “' + path.split('/').pop() + '”', wrap, [
+  const title = multi ? 'Share ' + target.length + ' items' : 'Share “' + target.split('/').pop() + '”';
+  openModal(title, wrap, [
     { label: 'Cancel', onClick: closeModal },
     {
       label: 'Create link',
       kind: 'primary',
       onClick: async () => {
         try {
-          const r = await api('/api/shares', {
-            method: 'POST',
-            body: { path, password: pw.value || undefined, expiresDays: exp.value || undefined, allowUpload: upCheck.checked }
-          });
+          const body = { password: pw.value || undefined, expiresDays: exp.value || undefined };
+          if (multi) body.paths = target;
+          else { body.path = target; body.allowUpload = upCheck.checked; }
+          const r = await api('/api/shares', { method: 'POST', body });
           closeModal();
           showShareLink(r.share);
         } catch (err) {

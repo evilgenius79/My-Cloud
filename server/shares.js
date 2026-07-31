@@ -8,7 +8,7 @@ import { settings } from './config.js';
 import { userDirs, authMiddleware, findUser } from './auth.js';
 import { safeJoin, listDir, realContained } from './fsutil.js';
 import { withLock } from './locks.js';
-import { sendFile, sendZip, streamUpload, isMultipart } from './files.js';
+import { sendFile, sendZip, sendZipItems, streamUpload, isMultipart } from './files.js';
 
 // Absolute cap on a single anonymous drop-box upload request, independent of
 // the owner's quota (which may be unlimited). Prevents disk-fill via shares.
@@ -55,21 +55,38 @@ sharesRouter.post('/', wrap(async (req, res) => {
   if (!settings.allowPublicShares) {
     return res.status(403).json({ error: 'Public share links are disabled by the administrator.' });
   }
-  const { path: sharePath, password, expiresDays, allowUpload } = req.body;
-  const abs = safeJoin(userDirs(req.user.username).files, sharePath);
-  const st = await fsp.stat(abs).catch(() => null);
-  if (!st) return res.status(404).json({ error: 'File not found.' });
-  const share = {
+  const { path: sharePath, paths, password, expiresDays, allowUpload } = req.body;
+  const filesRoot = userDirs(req.user.username).files;
+  const base = {
     token: crypto.randomBytes(16).toString('base64url'),
     owner: req.user.username,
-    path: String(sharePath).replace(/\\/g, '/').replace(/^\/+/, ''),
-    isDir: st.isDirectory(),
     passwordHash: password ? bcrypt.hashSync(String(password), 10) : null,
     expiresAt: expiresDays ? Date.now() + Number(expiresDays) * 86400000 : null,
-    allowUpload: !!allowUpload && st.isDirectory(),
     createdAt: Date.now(),
     downloads: 0
   };
+  let share;
+  if (Array.isArray(paths) && paths.length > 1) {
+    // Multi-item share: a selection of files/folders, downloaded together.
+    const items = [];
+    for (const p of paths) {
+      const abs = safeJoin(filesRoot, p);
+      if (await fsp.stat(abs).catch(() => null)) items.push(String(p).replace(/\\/g, '/').replace(/^\/+/, ''));
+    }
+    if (!items.length) return res.status(404).json({ error: 'None of the selected items were found.' });
+    share = { ...base, isMulti: true, items, isDir: true, allowUpload: false };
+  } else {
+    const single = sharePath || (Array.isArray(paths) && paths[0]);
+    const abs = safeJoin(filesRoot, single);
+    const st = await fsp.stat(abs).catch(() => null);
+    if (!st) return res.status(404).json({ error: 'File not found.' });
+    share = {
+      ...base,
+      path: String(single).replace(/\\/g, '/').replace(/^\/+/, ''),
+      isDir: st.isDirectory(),
+      allowUpload: !!allowUpload && st.isDirectory()
+    };
+  }
   sharesStore.data.shares.push(share);
   sharesStore.save();
   const { passwordHash, ...pub } = share;
@@ -126,11 +143,22 @@ function loadShare(req, res) {
   return share;
 }
 
+function itemAbs(share, index) {
+  const i = parseInt(index, 10);
+  if (!Number.isInteger(i) || i < 0 || i >= share.items.length) {
+    const e = new Error('Invalid item.'); e.status = 400; throw e;
+  }
+  return safeJoin(userDirs(share.owner).files, share.items[i]);
+}
+
 publicRouter.get('/api/:token/info', wrap(async (req, res) => {
   const share = loadShare(req, res);
   if (!share) return;
   if (!shareUnlocked(req, share)) {
     return res.json({ locked: true, name: null });
+  }
+  if (share.isMulti) {
+    return res.json({ locked: false, name: share.items.length + ' items', isDir: true, isMulti: true, size: null, allowUpload: false });
   }
   const abs = shareAbs(share);
   const st = await fsp.stat(abs).catch(() => null);
@@ -161,6 +189,15 @@ publicRouter.get('/api/:token/list', wrap(async (req, res) => {
   const share = loadShare(req, res);
   if (!share) return;
   if (!shareUnlocked(req, share)) return res.status(403).json({ error: 'Password required.' });
+  if (share.isMulti) {
+    const entries = [];
+    for (let i = 0; i < share.items.length; i++) {
+      const abs = safeJoin(userDirs(share.owner).files, share.items[i]);
+      const st = await fsp.stat(abs).catch(() => null);
+      if (st) entries.push({ i, name: path.basename(abs), isDir: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtime: st.mtimeMs });
+    }
+    return res.json({ entries, isMulti: true });
+  }
   if (!share.isDir) return res.status(400).json({ error: 'Not a folder share.' });
   const abs = safeJoin(shareAbs(share), req.query.path);
   const st = await fsp.stat(abs).catch(() => null);
@@ -172,6 +209,31 @@ publicRouter.get('/api/:token/download', wrap(async (req, res) => {
   const share = loadShare(req, res);
   if (!share) return;
   if (!shareUnlocked(req, share)) return res.status(403).json({ error: 'Password required.' });
+
+  if (share.isMulti) {
+    share.downloads = (share.downloads || 0) + 1;
+    scheduleSharesSave();
+    if (req.query.i === undefined) {
+      // Download all selected items as one zip.
+      const items = [];
+      for (let i = 0; i < share.items.length; i++) {
+        const abs = safeJoin(userDirs(share.owner).files, share.items[i]);
+        const st = await fsp.stat(abs).catch(() => null);
+        if (st && await realContained(userDirs(share.owner).files, abs)) {
+          items.push({ abs, name: path.basename(abs), isDir: st.isDirectory() });
+        }
+      }
+      if (!items.length) return res.status(404).json({ error: 'Nothing to download.' });
+      return sendZipItems(res, items, 'files.zip', { level: 0 });
+    }
+    const abs = itemAbs(share, req.query.i);
+    if (!await realContained(userDirs(share.owner).files, abs)) return res.status(404).json({ error: 'Not found.' });
+    const st = await fsp.stat(abs).catch(() => null);
+    if (!st) return res.status(404).json({ error: 'File not found.' });
+    if (st.isDirectory()) return sendZip(res, abs, (path.basename(abs) || 'folder') + '.zip', { level: 0 });
+    return sendFile(req, res, abs, { download: req.query.dl !== '0' });
+  }
+
   const shareRoot = shareAbs(share);
   let abs = shareRoot;
   if (share.isDir && req.query.path) abs = safeJoin(abs, req.query.path);
