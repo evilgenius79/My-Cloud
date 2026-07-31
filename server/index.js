@@ -5,8 +5,11 @@ import { PORT, settings, saveSettings } from './config.js';
 import {
   listUsers, findUser, createUser, updateUser, deleteUser, verifyPassword,
   makeSessionToken, sessionCookie, clearSessionCookie,
-  authMiddleware, adminMiddleware, loginRateLimit, clearLoginAttempts, publicRateLimit, userDirs
+  authMiddleware, adminMiddleware, loginRateLimit, clearLoginAttempts, publicRateLimit, userDirs,
+  totpEnabled, verifySecondFactor, beginTotpSetup, confirmTotp, disableTotp,
+  listAppPasswords, addAppPassword, removeAppPassword
 } from './auth.js';
+import QRCode from 'qrcode';
 import { filesRouter, trashRouter, purgeOldTrash, pruneThumbs } from './files.js';
 import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
 import { davRouter } from './webdav.js';
@@ -52,8 +55,52 @@ app.post('/api/setup', express.json(), (req, res) => {
 app.post('/api/auth/login', express.json(), loginRateLimit, (req, res) => {
   const user = verifyPassword(req.body.username, req.body.password);
   if (!user) return res.status(403).json({ error: 'Wrong username or password.' });
+  if (totpEnabled(user)) {
+    const code = req.body.code;
+    if (!code) return res.json({ twofa: true }); // prompt for a code, no session yet
+    if (!verifySecondFactor(user.username, code)) {
+      return res.status(403).json({ error: 'Incorrect authentication code.', twofa: true });
+    }
+  }
   clearLoginAttempts(user.username);
   res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username), req.secure));
+  res.json({ ok: true });
+});
+
+// --- Two-factor management (all require an active session) ---
+app.post('/api/auth/2fa/setup', authMiddleware, express.json(), wrap(async (req, res) => {
+  const { secret, otpauth } = beginTotpSetup(req.user.username);
+  const qr = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+  res.json({ secret, otpauth, qr });
+}));
+
+app.post('/api/auth/2fa/enable', authMiddleware, express.json(), (req, res) => {
+  try {
+    const recovery = confirmTotp(req.user.username, req.body.code);
+    res.json({ ok: true, recovery });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/2fa/disable', authMiddleware, express.json(), (req, res) => {
+  if (!verifyPassword(req.user.username, req.body.password)) {
+    return res.status(403).json({ error: 'Current password is wrong.' });
+  }
+  disableTotp(req.user.username);
+  res.json({ ok: true });
+});
+
+// --- App passwords (for WebDAV under 2FA) ---
+app.get('/api/auth/apppw', authMiddleware, (req, res) => {
+  res.json({ appPasswords: listAppPasswords(req.user.username) });
+});
+app.post('/api/auth/apppw', authMiddleware, express.json(), (req, res) => {
+  const { id, token } = addAppPassword(req.user.username, req.body.label);
+  res.json({ id, token });
+});
+app.delete('/api/auth/apppw/:id', authMiddleware, (req, res) => {
+  removeAppPassword(req.user.username, req.params.id);
   res.json({ ok: true });
 });
 
@@ -68,7 +115,8 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
     isAdmin: req.user.isAdmin,
     quotaMB: req.user.quotaMB || 0,
     siteName: settings.siteName,
-    allowPublicShares: settings.allowPublicShares !== false
+    allowPublicShares: settings.allowPublicShares !== false,
+    totpEnabled: totpEnabled(req.user)
   });
 });
 

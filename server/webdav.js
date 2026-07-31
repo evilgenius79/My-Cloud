@@ -7,7 +7,7 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import mime from 'mime-types';
-import { verifyPassword, userDirs } from './auth.js';
+import { verifyDavAuth, userDirs } from './auth.js';
 import { safeJoin, realContained } from './fsutil.js';
 
 export const davRouter = express.Router();
@@ -33,7 +33,7 @@ function basicAuth(req, res, next) {
   try { decoded = Buffer.from(header.slice(6), 'base64').toString('utf8'); } catch { return fail(); }
   const i = decoded.indexOf(':');
   if (i === -1) return fail();
-  const user = verifyPassword(decoded.slice(0, i), decoded.slice(i + 1));
+  const user = verifyDavAuth(decoded.slice(0, i), decoded.slice(i + 1));
   if (!user) return fail();
   authCache.set(key, { username: user.username, exp: Date.now() + AUTH_TTL });
   req.davUser = user.username;

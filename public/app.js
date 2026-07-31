@@ -131,10 +131,21 @@ $('auth-form').addEventListener('submit', async e => {
       if (password !== $('auth-password2').value) throw new Error('Passwords do not match.');
       await api('/api/setup', { method: 'POST', body: { username, password } });
     } else {
-      await api('/api/auth/login', { method: 'POST', body: { username, password } });
+      const code = $('auth-code').value.trim();
+      const r = await api('/api/auth/login', { method: 'POST', body: { username, password, code: code || undefined } });
+      if (r && r.twofa) {
+        // Second factor required: reveal the code field and wait for re-submit.
+        $('auth-code').classList.remove('hidden');
+        $('auth-subtitle').textContent = 'Enter the code from your authenticator app';
+        $('auth-submit').textContent = 'Verify';
+        setTimeout(() => $('auth-code').focus(), 50);
+        return;
+      }
     }
     $('auth-password').value = '';
     $('auth-password2').value = '';
+    $('auth-code').value = '';
+    $('auth-code').classList.add('hidden');
     await enterApp();
   } catch (err) {
     errEl.textContent = err.message;
@@ -1219,35 +1230,198 @@ $('btn-theme').addEventListener('click', () => {
   toast('Theme: ' + (next === 'auto' ? 'auto (follows your device)' : next));
 });
 
-// ---------- Account (change password) ----------
-$('btn-account').addEventListener('click', () => {
-  const cur = document.createElement('input');
-  cur.type = 'password';
-  cur.placeholder = 'Current password';
-  cur.autocomplete = 'current-password';
-  const next = document.createElement('input');
-  next.type = 'password';
-  next.placeholder = 'New password (min 6 chars)';
-  next.autocomplete = 'new-password';
+// ---------- Account & security ----------
+$('btn-account').addEventListener('click', openSecurityModal);
+
+async function openSecurityModal() {
   const wrap = document.createElement('div');
-  wrap.append(fieldEl('Current password', cur), fieldEl('New password', next));
-  openModal('Change password', wrap, [
+  const section = (title) => {
+    const h = document.createElement('h4');
+    h.textContent = title;
+    h.style.cssText = 'margin:18px 0 8px;font-size:14px';
+    wrap.appendChild(h);
+  };
+
+  // Change password
+  section('Change password');
+  const cur = Object.assign(document.createElement('input'), { type: 'password', placeholder: 'Current password', autocomplete: 'current-password' });
+  const next = Object.assign(document.createElement('input'), { type: 'password', placeholder: 'New password (min 6)', autocomplete: 'new-password' });
+  const pwBtn = document.createElement('button');
+  pwBtn.className = 'btn sm';
+  pwBtn.textContent = 'Update password';
+  pwBtn.addEventListener('click', async () => {
+    try {
+      await api('/api/auth/password', { method: 'POST', body: { current: cur.value, next: next.value } });
+      cur.value = ''; next.value = '';
+      toast('Password changed');
+    } catch (err) { toast(err.message, true); }
+  });
+  const pwRow = document.createElement('div');
+  pwRow.style.cssText = 'display:flex;flex-direction:column;gap:8px';
+  pwRow.append(cur, next, pwBtn);
+  wrap.appendChild(pwRow);
+
+  // Two-factor
+  section('Two-factor authentication');
+  const twofaBox = document.createElement('div');
+  twofaBox.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+  if (state.user.totpEnabled) {
+    twofaBox.innerHTML = '<span class="badge">enabled</span>';
+    const off = document.createElement('button');
+    off.className = 'btn sm danger';
+    off.textContent = 'Turn off';
+    off.addEventListener('click', () => disable2fa());
+    twofaBox.appendChild(off);
+  } else {
+    const p = document.createElement('span');
+    p.className = 'muted';
+    p.style.fontSize = '13px';
+    p.textContent = 'Add a code from an authenticator app at sign-in.';
+    const on = document.createElement('button');
+    on.className = 'btn sm primary';
+    on.textContent = 'Set up';
+    on.addEventListener('click', () => setup2fa());
+    twofaBox.append(p, on);
+  }
+  wrap.appendChild(twofaBox);
+
+  // App passwords
+  section('App passwords');
+  const apInfo = document.createElement('p');
+  apInfo.className = 'muted';
+  apInfo.style.fontSize = '13px';
+  apInfo.textContent = state.user.totpEnabled
+    ? 'With 2FA on, WebDAV needs an app password (your normal password won\'t work there).'
+    : 'Optional: dedicated passwords for WebDAV / apps you can revoke individually.';
+  const apList = document.createElement('div');
+  const apAddRow = document.createElement('div');
+  apAddRow.className = 'share-link-row';
+  const apLabel = Object.assign(document.createElement('input'), { placeholder: 'Label (e.g. Laptop)' });
+  const apAdd = document.createElement('button');
+  apAdd.className = 'btn primary';
+  apAdd.textContent = 'Create';
+  apAdd.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/auth/apppw', { method: 'POST', body: { label: apLabel.value.trim() || 'App' } });
+      apLabel.value = '';
+      showAppPasswordToken(r.token);
+    } catch (err) { toast(err.message, true); }
+  });
+  apAddRow.append(apLabel, apAdd);
+  wrap.append(apInfo, apList, apAddRow);
+
+  async function renderAppPws() {
+    const data = await api('/api/auth/apppw').catch(() => ({ appPasswords: [] }));
+    apList.innerHTML = '';
+    for (const a of data.appPasswords) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 0;font-size:13px';
+      const name = document.createElement('span');
+      name.style.flex = '1';
+      name.textContent = a.label;
+      const rev = document.createElement('button');
+      rev.className = 'btn sm danger';
+      rev.textContent = 'Revoke';
+      rev.addEventListener('click', async () => {
+        await api('/api/auth/apppw/' + encodeURIComponent(a.id), { method: 'DELETE' }).catch(() => {});
+        renderAppPws();
+      });
+      row.append(name, rev);
+      apList.appendChild(row);
+    }
+  }
+  renderAppPws();
+
+  openModal('Account & security', wrap, [{ label: 'Close', kind: 'primary', onClick: closeModal }]);
+}
+
+function showAppPasswordToken(token) {
+  const wrap = document.createElement('div');
+  const p = document.createElement('p');
+  p.className = 'muted';
+  p.style.fontSize = '13px';
+  p.textContent = 'Use this as the password in your WebDAV client. It won\'t be shown again.';
+  const row = document.createElement('div');
+  row.className = 'share-link-row';
+  const input = Object.assign(document.createElement('input'), { value: token, readOnly: true });
+  const copy = document.createElement('button');
+  copy.className = 'btn primary';
+  copy.textContent = 'Copy';
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(token); toast('Copied'); }
+    catch { input.select(); document.execCommand('copy'); toast('Copied'); }
+  });
+  row.append(input, copy);
+  wrap.append(p, row);
+  openModal('App password created', wrap, [{ label: 'Done', kind: 'primary', onClick: () => { closeModal(); openSecurityModal(); } }]);
+  input.select();
+}
+
+async function setup2fa() {
+  let data;
+  try { data = await api('/api/auth/2fa/setup', { method: 'POST' }); }
+  catch (err) { return toast(err.message, true); }
+  const wrap = document.createElement('div');
+  const img = document.createElement('img');
+  img.src = data.qr;
+  img.alt = 'QR code';
+  img.style.cssText = 'display:block;margin:0 auto;border-radius:8px;background:#fff;padding:6px';
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.style.cssText = 'font-size:13px;text-align:center';
+  hint.innerHTML = 'Scan with your authenticator app, or enter this key:<br><code style="user-select:all">' + data.secret + '</code>';
+  const code = Object.assign(document.createElement('input'), { placeholder: '6-digit code', inputMode: 'numeric', autocomplete: 'one-time-code' });
+  wrap.append(img, hint, fieldEl('Enter the code to confirm', code));
+  openModal('Set up two-factor', wrap, [
     { label: 'Cancel', onClick: closeModal },
     {
-      label: 'Change',
+      label: 'Enable',
       kind: 'primary',
       onClick: async () => {
         try {
-          await api('/api/auth/password', { method: 'POST', body: { current: cur.value, next: next.value } });
-          closeModal();
-          toast('Password changed');
-        } catch (err) {
-          toast(err.message, true);
-        }
+          const r = await api('/api/auth/2fa/enable', { method: 'POST', body: { code: code.value.trim() } });
+          state.user.totpEnabled = true;
+          showRecoveryCodes(r.recovery);
+        } catch (err) { toast(err.message, true); }
       }
     }
   ]);
-});
+  setTimeout(() => code.focus(), 50);
+}
+
+function showRecoveryCodes(codes) {
+  const wrap = document.createElement('div');
+  const p = document.createElement('p');
+  p.className = 'muted';
+  p.style.fontSize = '13px';
+  p.textContent = 'Save these recovery codes somewhere safe. Each can be used once if you lose your authenticator.';
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'background:var(--panel-2);padding:12px;border-radius:8px;font-size:14px;user-select:all;line-height:1.8';
+  pre.textContent = codes.join('\n');
+  wrap.append(p, pre);
+  openModal('Two-factor enabled ✓', wrap, [{ label: 'Done', kind: 'primary', onClick: () => { closeModal(); toast('Two-factor is on'); } }]);
+}
+
+function disable2fa() {
+  const pw = Object.assign(document.createElement('input'), { type: 'password', placeholder: 'Current password', autocomplete: 'current-password' });
+  const wrap = document.createElement('div');
+  wrap.append(fieldEl('Confirm your password to turn off 2FA', pw));
+  openModal('Turn off two-factor', wrap, [
+    { label: 'Cancel', onClick: closeModal },
+    {
+      label: 'Turn off',
+      kind: 'danger',
+      onClick: async () => {
+        try {
+          await api('/api/auth/2fa/disable', { method: 'POST', body: { password: pw.value } });
+          state.user.totpEnabled = false;
+          closeModal();
+          toast('Two-factor turned off');
+        } catch (err) { toast(err.message, true); }
+      }
+    }
+  ]);
+}
 
 // ---------- Connect a drive (WebDAV) ----------
 $('btn-connect').addEventListener('click', () => {

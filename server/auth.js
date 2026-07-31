@@ -4,6 +4,9 @@ import fs from 'fs';
 import path from 'path';
 import { DATA_DIR, secret, settings } from './config.js';
 import { JsonStore } from './store.js';
+import { generateSecret, verifyTotp, otpauthUri } from './totp.js';
+
+const DUMMY_HASH = '$2a$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ012345';
 
 const usersStore = new JsonStore('users.json', { users: [] }, { critical: true });
 
@@ -79,10 +82,96 @@ export function verifyPassword(username, password) {
   const user = findUser(String(username || '').toLowerCase().trim());
   if (!user) {
     // Burn comparable time so missing users aren't distinguishable by timing.
-    bcrypt.compareSync(String(password || ''), '$2a$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ012345');
+    bcrypt.compareSync(String(password || ''), DUMMY_HASH);
     return null;
   }
   return bcrypt.compareSync(String(password || ''), user.passwordHash) ? user : null;
+}
+
+// --- Two-factor (TOTP) ---
+export function totpEnabled(user) { return !!(user && user.totpSecret); }
+
+export function beginTotpSetup(username) {
+  const user = findUser(username);
+  if (!user) throw new Error('User not found.');
+  const s = generateSecret();
+  user.totpPending = s; // held until confirmed with a valid code
+  usersStore.save();
+  return { secret: s, otpauth: otpauthUri(s, username, settings.siteName || 'My Cloud') };
+}
+
+export function confirmTotp(username, code) {
+  const user = findUser(username);
+  if (!user) throw new Error('User not found.');
+  if (!user.totpPending) throw new Error('Start two-factor setup first.');
+  if (!verifyTotp(user.totpPending, code)) throw new Error('That code is incorrect. Try again.');
+  user.totpSecret = user.totpPending;
+  delete user.totpPending;
+  const codes = [];
+  user.recovery = [];
+  for (let i = 0; i < 10; i++) {
+    const c = crypto.randomBytes(5).toString('hex');
+    codes.push(c);
+    user.recovery.push(bcrypt.hashSync(c, 10));
+  }
+  usersStore.save();
+  return codes; // shown once
+}
+
+export function disableTotp(username) {
+  const user = findUser(username);
+  if (!user) throw new Error('User not found.');
+  delete user.totpSecret;
+  delete user.totpPending;
+  delete user.recovery;
+  usersStore.save();
+}
+
+// Second login factor: a TOTP code or a one-time recovery code (consumed).
+export function verifySecondFactor(username, code) {
+  const user = findUser(username);
+  if (!user || !user.totpSecret) return false;
+  if (verifyTotp(user.totpSecret, code)) return true;
+  const clean = String(code || '').replace(/\s/g, '').toLowerCase();
+  const idx = (user.recovery || []).findIndex(h => bcrypt.compareSync(clean, h));
+  if (idx !== -1) { user.recovery.splice(idx, 1); usersStore.save(); return true; }
+  return false;
+}
+
+// --- App passwords (for WebDAV / Basic auth, which can't do interactive 2FA) ---
+export function listAppPasswords(username) {
+  const u = findUser(username);
+  return (u?.appPasswords || []).map(({ hash, ...a }) => a);
+}
+
+export function addAppPassword(username, label) {
+  const u = findUser(username);
+  if (!u) throw new Error('User not found.');
+  const token = crypto.randomBytes(15).toString('base64url');
+  u.appPasswords = u.appPasswords || [];
+  const id = crypto.randomBytes(4).toString('hex');
+  u.appPasswords.push({ id, label: String(label || 'App').slice(0, 40), hash: bcrypt.hashSync(token, 10), createdAt: Date.now() });
+  usersStore.save();
+  return { id, token };
+}
+
+export function removeAppPassword(username, id) {
+  const u = findUser(username);
+  if (!u) return;
+  u.appPasswords = (u.appPasswords || []).filter(a => a.id !== id);
+  usersStore.save();
+}
+
+// WebDAV/Basic auth: an app password always works; the account password works
+// only when 2FA is off (otherwise it would be a 2FA bypass).
+export function verifyDavAuth(username, secret) {
+  const u = findUser(String(username || '').toLowerCase().trim());
+  if (!u) { bcrypt.compareSync(String(secret || ''), DUMMY_HASH); return null; }
+  for (const ap of (u.appPasswords || [])) {
+    if (bcrypt.compareSync(String(secret || ''), ap.hash)) return u;
+  }
+  if (u.totpSecret) return null; // must use an app password
+  return bcrypt.compareSync(String(secret || ''), u.passwordHash) ? u : null;
 }
 
 // --- Stateless signed session tokens (survive restarts, no session table) ---
