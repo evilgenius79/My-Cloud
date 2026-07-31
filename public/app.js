@@ -1249,6 +1249,40 @@ $('btn-account').addEventListener('click', () => {
   ]);
 });
 
+// ---------- Connect a drive (WebDAV) ----------
+$('btn-connect').addEventListener('click', () => {
+  const url = location.origin + '/dav/';
+  const wrap = document.createElement('div');
+  const row = document.createElement('div');
+  row.className = 'share-link-row';
+  const input = document.createElement('input');
+  input.value = url;
+  input.readOnly = true;
+  const copy = document.createElement('button');
+  copy.className = 'btn primary';
+  copy.textContent = 'Copy';
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(url); toast('URL copied'); }
+    catch { input.select(); document.execCommand('copy'); toast('URL copied'); }
+  });
+  row.append(input, copy);
+  const help = document.createElement('div');
+  help.className = 'muted';
+  help.style.fontSize = '13px';
+  help.style.marginTop = '10px';
+  help.innerHTML =
+    'Mount your files as a network drive using your My Cloud username and password:' +
+    '<ul style="margin:8px 0 0;padding-left:18px;line-height:1.6">' +
+    '<li><b>Windows:</b> This PC → Map network drive → the URL above</li>' +
+    '<li><b>macOS:</b> Finder → Go → Connect to Server → the URL above</li>' +
+    '<li><b>Linux / rclone / mobile:</b> add a WebDAV remote pointing at the URL</li>' +
+    '</ul>' +
+    '<p style="margin:10px 0 0">Use <b>HTTPS</b> for connections outside your home network.</p>';
+  wrap.append(row, help);
+  openModal('Connect a drive (WebDAV)', wrap, [{ label: 'Done', kind: 'primary', onClick: closeModal }]);
+  input.select();
+});
+
 // ---------- PWA service worker ----------
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));

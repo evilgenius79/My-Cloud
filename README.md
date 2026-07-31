@@ -18,7 +18,9 @@ Everything is stored as plain files:
 - 🗑 **Trash bin** — deletes go to trash first, with restore and configurable auto-purge
 - 🔍 **Search** — instant filename search across your whole home folder
 - 📦 **Zip downloads** — download any folder or multi-selection as a zip, streamed on the fly
-- 📱 **Responsive UI** — works nicely on phones, with automatic light/dark theme
+- 🖼️ **Thumbnails** — fast server-generated, disk-cached image thumbnails so photo folders load instantly
+- 🔌 **WebDAV** — mount your files as a network drive in Finder, Windows Explorer, mobile apps, or rclone (`/dav/`, sign in with your account)
+- 📱 **Responsive UI + installable PWA** — works nicely on phones with automatic light/dark theme, and installs as an app ("Add to Home Screen")
 - 🧳 **First-run setup** — open the web UI once and create your admin account; that's it
 
 ## Quick start (Unraid)

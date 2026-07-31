@@ -9,6 +9,7 @@ import {
 } from './auth.js';
 import { filesRouter, trashRouter, purgeOldTrash, pruneThumbs } from './files.js';
 import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
+import { davRouter } from './webdav.js';
 import { dirSize } from './fsutil.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,6 +92,8 @@ app.post('/api/auth/password', authMiddleware, express.json(), (req, res) => {
 
 app.use('/api/files', authMiddleware, express.json({ limit: '1mb' }), filesRouter);
 app.use('/api/trash', authMiddleware, express.json({ limit: '1mb' }), trashRouter);
+// WebDAV — mounted before the JSON parsers so PUT bodies stream raw.
+app.use('/dav', davRouter);
 app.use('/api/shares', express.json({ limit: '1mb' }), sharesRouter);
 // Rate-limit the unauthenticated share surface. Tighter budget for the
 // expensive zip/upload paths; looser for info/list/download of single files.
