@@ -10,6 +10,9 @@ RUN apk add --no-cache su-exec
 # Deterministic install from the committed lockfile.
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
+# Fail the build (not the user's container) if the native sharp binary can't
+# load on this platform/libc, since the app imports it at startup.
+RUN node -e "require('sharp'); console.log('sharp loads OK')"
 
 COPY server ./server
 COPY public ./public
