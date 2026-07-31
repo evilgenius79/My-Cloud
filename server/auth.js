@@ -17,7 +17,12 @@ export function findUser(username) {
 
 export function userDirs(username) {
   const base = path.join(DATA_DIR, 'users', username);
-  return { base, files: path.join(base, 'files'), trash: path.join(base, 'trash') };
+  return {
+    base,
+    files: path.join(base, 'files'),
+    trash: path.join(base, 'trash'),
+    thumbs: path.join(base, 'thumbs') // derived thumbnail cache (not user-visible)
+  };
 }
 
 const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{1,31}$/;

@@ -7,7 +7,7 @@ import {
   makeSessionToken, sessionCookie, clearSessionCookie,
   authMiddleware, adminMiddleware, loginRateLimit, clearLoginAttempts, publicRateLimit, userDirs
 } from './auth.js';
-import { filesRouter, trashRouter, purgeOldTrash } from './files.js';
+import { filesRouter, trashRouter, purgeOldTrash, pruneThumbs } from './files.js';
 import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
 import { dirSize } from './fsutil.js';
 
@@ -199,10 +199,11 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Trash auto-purge, hourly.
+// Hourly housekeeping: trash auto-purge + thumbnail-cache cap.
 setInterval(() => {
   for (const u of listUsers()) {
     purgeOldTrash(u.username, settings.trashRetentionDays).catch(() => {});
+    pruneThumbs(u.username).catch(() => {});
   }
 }, 3600000).unref();
 

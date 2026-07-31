@@ -6,6 +6,7 @@ import path from 'path';
 import Busboy from 'busboy';
 import archiver from 'archiver';
 import mime from 'mime-types';
+import sharp from 'sharp';
 import { userDirs } from './auth.js';
 import { withLock } from './locks.js';
 import {
@@ -113,6 +114,50 @@ filesRouter.get('/download', wrap(async (req, res) => {
   const st = await fsp.stat(abs);
   if (st.isDirectory()) return sendZip(res, abs, path.basename(abs) + '.zip');
   sendFile(req, res, abs, { download: req.query.dl !== '0' });
+}));
+
+// Server-generated, disk-cached thumbnails for images. Cache lives outside the
+// user's files dir so it isn't listed and doesn't count toward quota.
+const THUMB_EXT = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'tiff', 'tif', 'bmp']);
+const THUMB_MAX_INPUT = 60 * 1024 * 1024; // don't try to decode enormous files
+
+filesRouter.get('/thumb', wrap(async (req, res) => {
+  const rel = String(req.query.path || '');
+  const ext = path.extname(rel).slice(1).toLowerCase();
+  if (!THUMB_EXT.has(ext)) return res.status(415).json({ error: 'No thumbnail for this type.' });
+  const filesRoot = root(req);
+  const abs = safeJoin(filesRoot, rel);
+  if (!await realContained(filesRoot, abs)) return res.status(404).json({ error: 'Not found.' });
+  const st = await fsp.stat(abs).catch(() => null);
+  if (!st || st.isDirectory()) return res.status(404).json({ error: 'Not found.' });
+  if (st.size > THUMB_MAX_INPUT) return res.status(413).json({ error: 'Image too large to thumbnail.' });
+
+  const size = Math.min(512, Math.max(64, parseInt(req.query.s, 10) || 256));
+  const dirs = userDirs(req.user.username);
+  // Key by path + mtime + size so edits and different sizes get fresh thumbs.
+  const key = crypto.createHash('sha1')
+    .update(rel + '|' + Math.round(st.mtimeMs) + '|' + st.size + '|' + size).digest('hex');
+  const cacheFile = path.join(dirs.thumbs, key + '.webp');
+
+  res.setHeader('Content-Type', 'image/webp');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.setHeader('ETag', '"' + key + '"');
+  if (req.headers['if-none-match'] === '"' + key + '"') return res.status(304).end();
+
+  if (fs.existsSync(cacheFile)) return fs.createReadStream(cacheFile).pipe(res);
+
+  try {
+    const buf = await sharp(abs, { failOn: 'none', pages: 1 })
+      .rotate() // honor EXIF orientation
+      .resize(size, size, { fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 72 })
+      .toBuffer();
+    fs.mkdirSync(dirs.thumbs, { recursive: true });
+    fs.writeFile(cacheFile, buf, () => {}); // cache write is best-effort
+    res.end(buf);
+  } catch {
+    res.status(422).json({ error: 'Could not render thumbnail.' });
+  }
 }));
 
 // Zip an arbitrary selection of entries from one folder.
@@ -510,6 +555,26 @@ trashRouter.post('/empty', wrap(async (req, res) => {
   }
   res.json({ ok: true });
 }));
+
+// Cap the per-user thumbnail cache (stale thumbs accumulate as files change).
+// Keeps the newest MAX by mtime, deletes the rest. Called from the hourly timer.
+export async function pruneThumbs(username, max = 4000) {
+  const dir = userDirs(username).thumbs;
+  let names;
+  try {
+    names = await fsp.readdir(dir);
+  } catch {
+    return;
+  }
+  if (names.length <= max) return;
+  const stats = [];
+  for (const n of names) {
+    const st = await fsp.stat(path.join(dir, n)).catch(() => null);
+    if (st) stats.push({ n, m: st.mtimeMs });
+  }
+  stats.sort((a, b) => b.m - a.m);
+  for (const { n } of stats.slice(max)) await fsp.rm(path.join(dir, n), { force: true });
+}
 
 // Purge trash items older than retention. Called on a timer from index.js.
 // Retention 0 means "keep forever" for normal items, but we still sweep

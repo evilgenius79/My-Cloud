@@ -43,6 +43,8 @@ function fmtDate(ms) {
 }
 
 const IMG_EXT = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'avif', 'ico']);
+// Types the server can generate a thumbnail for (superset excludes svg/ico).
+const THUMB_EXT = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'tiff', 'tif', 'bmp']);
 const VID_EXT = new Set(['mp4', 'webm', 'mov', 'm4v', 'mkv', 'ogv']);
 const AUD_EXT = new Set(['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'opus']);
 const TXT_EXT = new Set(['txt', 'md', 'log', 'json', 'js', 'ts', 'css', 'html', 'xml', 'yml', 'yaml',
@@ -251,10 +253,11 @@ function renderEntries() {
 
     const thumb = document.createElement('div');
     thumb.className = 'thumb';
-    if (!entry.isDir && IMG_EXT.has(extOf(entry.name)) && entry.size < 15 * 1024 * 1024) {
+    if (!entry.isDir && THUMB_EXT.has(extOf(entry.name)) && entry.size < 60 * 1024 * 1024) {
       const img = document.createElement('img');
       img.loading = 'lazy';
-      img.src = fileUrl(joinPath(state.path, entry.name), false);
+      const s = state.viewMode === 'grid' ? 256 : 64;
+      img.src = '/api/files/thumb?path=' + encodeURIComponent(joinPath(state.path, entry.name)) + '&s=' + s;
       img.alt = '';
       img.onerror = () => { thumb.textContent = iconFor(entry); };
       thumb.appendChild(img);
