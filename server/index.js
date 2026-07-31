@@ -10,7 +10,7 @@ import {
   listAppPasswords, addAppPassword, removeAppPassword
 } from './auth.js';
 import QRCode from 'qrcode';
-import { filesRouter, trashRouter, purgeOldTrash, pruneThumbs } from './files.js';
+import { filesRouter, trashRouter, purgeOldTrash, pruneThumbs, purgeOldSessions } from './files.js';
 import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
 import { davRouter } from './webdav.js';
 import { dirSize } from './fsutil.js';
@@ -255,6 +255,7 @@ setInterval(() => {
   for (const u of listUsers()) {
     purgeOldTrash(u.username, settings.trashRetentionDays).catch(() => {});
     pruneThumbs(u.username).catch(() => {});
+    purgeOldSessions(u.username).catch(() => {});
   }
 }, 3600000).unref();
 

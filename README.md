@@ -11,7 +11,9 @@ Everything is stored as plain files:
 
 - 🔐 **Multi-user accounts** — admin-managed users with bcrypt-hashed passwords, per-user storage quotas, and isolated home folders
 - 📁 **Fast web file browser** — grid & list views, breadcrumbs, multi-select (Ctrl/Shift-click), rename, move, copy, new folders
-- ⬆️ **Drag & drop uploads** — multiple files and whole folders, with a live progress bar; quota enforced server-side
+- ⬆️ **Drag & drop uploads** — multiple files and whole folders, with a live progress bar; large files upload in **resumable chunks** that survive a dropped connection; quota enforced server-side
+- 🔐 **Optional two-factor (TOTP)** — authenticator-app codes with recovery codes, plus revocable app passwords for WebDAV
+- 🔗 **Multi-item share links** — share a whole selection of files/folders behind one link
 - 👁 **Previews** — images, video and audio (with seeking), PDFs, and text/code files
 - ✏️ **Built-in text editor** — edit notes, configs, and markdown right in the browser
 - 🔗 **Public share links** — share any file or folder with a link; optional password, optional expiry, and optional "drop box" mode letting visitors upload into a shared folder

@@ -197,12 +197,17 @@ filesRouter.post('/zip', wrap(async (req, res) => {
   archive.finalize();
 }));
 
-// Total on-disk footprint for a user: files AND trash. Counting trash stops a
-// fill -> delete -> fill loop from bypassing quota while bytes still occupy disk.
+// Total on-disk footprint for a user: files, trash, AND in-progress resumable
+// upload parts. Counting trash stops a fill -> delete -> fill bypass; counting
+// upload parts stops many concurrent sessions from bypassing quota.
 export async function usedBytes(username) {
   const d = userDirs(username);
-  const [f, t] = await Promise.all([dirSize(d.files), dirSize(d.trash).catch(() => 0)]);
-  return f + t;
+  const [f, t, u] = await Promise.all([
+    dirSize(d.files),
+    dirSize(d.trash).catch(() => 0),
+    dirSize(path.join(d.base, 'uploads')).catch(() => 0)
+  ]);
+  return f + t + u;
 }
 
 async function quotaRemaining(req) {
@@ -339,6 +344,113 @@ filesRouter.post('/upload', wrap(async (req, res) => {
   await withLock('quota:' + req.user.username, () =>
     streamUpload(req, res, { username: req.user.username, destDir, allowSubdirs: true, quotaBytes }));
 }));
+
+// --- Resumable / chunked uploads ---
+// A session writes bytes into a .part file under the user's uploads/ dir; a
+// dropped connection resumes from the current part size. On complete, the part
+// is committed into the destination (quota-checked, atomically renamed).
+const MAX_SESSION_AGE = 24 * 3600000;
+
+function sessionsDir(username) { return path.join(userDirs(username).base, 'uploads'); }
+
+async function readSessionMeta(username, id) {
+  if (!validName(id)) return null;
+  try {
+    return JSON.parse(await fsp.readFile(path.join(sessionsDir(username), id + '.json'), 'utf8'));
+  } catch { return null; }
+}
+
+filesRouter.post('/upload/session', wrap(async (req, res) => {
+  const { path: destPath, name, size } = req.body;
+  if (!validName(name)) return res.status(400).json({ error: 'Invalid file name.' });
+  const total = Number(size);
+  if (!Number.isFinite(total) || total < 0) return res.status(400).json({ error: 'Invalid size.' });
+  const destDir = safeJoin(root(req), destPath);
+  const st = await fsp.stat(destDir).catch(() => null);
+  if (!st || !st.isDirectory()) return res.status(400).json({ error: 'Destination folder not found.' });
+  const remaining = await quotaRemaining(req);
+  if (total > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
+
+  const dir = sessionsDir(req.user.username);
+  fs.mkdirSync(dir, { recursive: true });
+  const id = Date.now().toString(36) + crypto.randomBytes(6).toString('hex');
+  const meta = { id, destPath: String(destPath || ''), name, size: total, createdAt: Date.now() };
+  await fsp.writeFile(path.join(dir, id + '.json'), JSON.stringify(meta));
+  await fsp.writeFile(path.join(dir, id + '.part'), ''); // start empty
+  res.json({ id, offset: 0 });
+}));
+
+filesRouter.get('/upload/session/:id', wrap(async (req, res) => {
+  const meta = await readSessionMeta(req.user.username, req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Session not found.' });
+  const part = path.join(sessionsDir(req.user.username), req.params.id + '.part');
+  const st = await fsp.stat(part).catch(() => null);
+  res.json({ id: meta.id, offset: st ? st.size : 0, size: meta.size, name: meta.name });
+}));
+
+filesRouter.put('/upload/session/:id', express.raw({ type: '*/*', limit: '64mb' }), wrap(async (req, res) => {
+  const username = req.user.username;
+  const meta = await readSessionMeta(username, req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Session not found.' });
+  const part = path.join(sessionsDir(username), req.params.id + '.part');
+  const current = (await fsp.stat(part).catch(() => ({ size: 0 }))).size;
+  const offset = parseInt(req.query.offset, 10);
+  // Strict sequential append; on mismatch tell the client where to resume.
+  if (offset !== current) return res.status(409).json({ error: 'Offset mismatch.', offset: current });
+  const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  if (current + chunk.length > meta.size) return res.status(413).json({ error: 'Exceeds declared size.' });
+  const remaining = await quotaRemaining(req);
+  if (chunk.length > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
+  await fsp.appendFile(part, chunk);
+  res.json({ offset: current + chunk.length });
+}));
+
+filesRouter.post('/upload/session/:id/complete', wrap(async (req, res) => {
+  const username = req.user.username;
+  await withLock('quota:' + username, async () => {
+    const meta = await readSessionMeta(username, req.params.id);
+    if (!meta) return res.status(404).json({ error: 'Session not found.' });
+    const dir = sessionsDir(username);
+    const part = path.join(dir, req.params.id + '.part');
+    const st = await fsp.stat(part).catch(() => null);
+    if (!st) return res.status(404).json({ error: 'Upload data missing.' });
+    if (st.size !== meta.size) return res.status(400).json({ error: 'Upload incomplete.', offset: st.size });
+    const destDir = safeJoin(root(req), meta.destPath);
+    if (!fs.existsSync(destDir)) return res.status(400).json({ error: 'Destination folder is gone.' });
+    const remaining = await quotaRemaining(req);
+    if (st.size > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
+    const finalName = uniqueName(destDir, meta.name);
+    await moveEntry(part, path.join(destDir, finalName));
+    await fsp.rm(path.join(dir, req.params.id + '.json'), { force: true });
+    res.json({ saved: meta.destPath ? meta.destPath + '/' + finalName : finalName });
+  });
+}));
+
+filesRouter.delete('/upload/session/:id', wrap(async (req, res) => {
+  if (!validName(req.params.id)) return res.status(400).json({ error: 'Invalid id.' });
+  const dir = sessionsDir(req.user.username);
+  await fsp.rm(path.join(dir, req.params.id + '.part'), { force: true });
+  await fsp.rm(path.join(dir, req.params.id + '.json'), { force: true });
+  res.json({ ok: true });
+}));
+
+// Remove abandoned upload sessions. Called from the hourly timer.
+export async function purgeOldSessions(username) {
+  const dir = sessionsDir(username);
+  let names;
+  try { names = await fsp.readdir(dir); } catch { return; }
+  const cutoff = Date.now() - MAX_SESSION_AGE;
+  for (const n of names) {
+    if (!n.endsWith('.json')) continue;
+    try {
+      const meta = JSON.parse(await fsp.readFile(path.join(dir, n), 'utf8'));
+      if (meta.createdAt < cutoff) {
+        await fsp.rm(path.join(dir, meta.id + '.part'), { force: true });
+        await fsp.rm(path.join(dir, n), { force: true });
+      }
+    } catch { /* skip */ }
+  }
+}
 
 filesRouter.post('/mkdir', wrap(async (req, res) => {
   const { path: dirPath, name } = req.body;

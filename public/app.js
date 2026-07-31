@@ -671,47 +671,125 @@ $('file-input').addEventListener('change', e => {
   e.target.value = '';
 });
 
-function uploadFiles(files, relNames = null) {
-  const form = new FormData();
-  files.forEach((f, i) => {
-    const name = relNames ? relNames[i] : (f.webkitRelativePath || f.name);
-    form.append('files', f, name);
-  });
-  const total = files.reduce((s, f) => s + f.size, 0);
+const CHUNK_THRESHOLD = 8 * 1024 * 1024;   // files bigger than this go chunked
+const CHUNK_SIZE = 5 * 1024 * 1024;
+
+function showUploadPanel(title) {
   const panel = $('upload-panel');
   panel.classList.remove('hidden');
-  $('upload-title').textContent = `Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`;
+  $('upload-title').textContent = title;
   $('upload-detail').textContent = '';
+  $('upload-fill').style.width = '0';
+}
+function setUploadProgress(loaded, total) {
+  $('upload-fill').style.width = (total ? (loaded / total) * 100 : 0) + '%';
+  $('upload-detail').textContent = `${fmtSize(loaded)} of ${fmtSize(total)}`;
+}
 
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/files/upload?path=' + encodeURIComponent(state.path));
-  xhr.upload.onprogress = e => {
-    if (e.lengthComputable) {
-      const pct = (e.loaded / e.total) * 100;
-      $('upload-fill').style.width = pct + '%';
-      $('upload-detail').textContent = `${fmtSize(e.loaded)} of ${fmtSize(total)}`;
-    }
-  };
-  xhr.onload = () => {
-    let data = {};
-    try { data = JSON.parse(xhr.responseText); } catch { /* ignore */ }
-    if (xhr.status === 200) {
-      $('upload-title').textContent = 'Upload complete';
-      toast(`Uploaded ${data.saved?.length ?? files.length} file${(data.saved?.length ?? files.length) === 1 ? '' : 's'}`);
-      setTimeout(() => panel.classList.add('hidden'), 1600);
-    } else {
-      $('upload-title').textContent = 'Upload failed';
-      toast(data.error || 'Upload failed.', true);
-    }
-    $('upload-fill').style.width = '0';
+// Route uploads: big top-level files use resumable chunks; everything else
+// (small files, folder-structure uploads) uses the multipart batch.
+async function uploadFiles(files, relNames = null) {
+  const names = files.map((f, i) => relNames ? relNames[i] : (f.webkitRelativePath || f.name));
+  const small = [], smallNames = [], big = [];
+  files.forEach((f, i) => {
+    if (f.size > CHUNK_THRESHOLD && !names[i].includes('/')) big.push(f);
+    else { small.push(f); smallNames.push(names[i]); }
+  });
+  try {
+    if (small.length) await uploadMultipart(small, smallNames);
+    for (const f of big) await uploadChunked(f);
+  } finally {
     loadFiles(state.path);
     refreshUsage();
-  };
-  xhr.onerror = () => {
-    $('upload-title').textContent = 'Upload failed';
-    toast('Upload failed — connection error.', true);
-  };
-  xhr.send(form);
+  }
+}
+
+function uploadMultipart(files, names) {
+  return new Promise(resolve => {
+    const form = new FormData();
+    files.forEach((f, i) => form.append('files', f, names[i]));
+    const total = files.reduce((s, f) => s + f.size, 0);
+    showUploadPanel(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/files/upload?path=' + encodeURIComponent(state.path));
+    xhr.upload.onprogress = e => { if (e.lengthComputable) setUploadProgress(e.loaded, e.total); };
+    xhr.onload = () => {
+      let data = {}; try { data = JSON.parse(xhr.responseText); } catch { /* ignore */ }
+      if (xhr.status === 200) {
+        $('upload-title').textContent = 'Upload complete';
+        toast(`Uploaded ${data.saved?.length ?? files.length} file${(data.saved?.length ?? files.length) === 1 ? '' : 's'}`);
+        setTimeout(() => $('upload-panel').classList.add('hidden'), 1600);
+      } else {
+        $('upload-title').textContent = 'Upload failed';
+        toast(data.error || 'Upload failed.', true);
+      }
+      resolve();
+    };
+    xhr.onerror = () => { $('upload-title').textContent = 'Upload failed'; toast('Upload failed — connection error.', true); resolve(); };
+    xhr.send(form);
+  });
+}
+
+// Resumable upload for a single large file. Survives a dropped connection:
+// the session id is remembered so a retry resumes from the server's offset.
+async function uploadChunked(file) {
+  showUploadPanel(`Uploading ${file.name}…`);
+  const key = 'mycloud_up_' + state.path + '|' + file.name + '|' + file.size + '|' + file.lastModified;
+  let id = localStorage.getItem(key);
+  let offset = 0;
+  try {
+    if (id) {
+      // Resume an existing session if the server still has it.
+      const st = await api('/api/files/upload/session/' + id).catch(() => null);
+      if (st && st.size === file.size) offset = st.offset;
+      else { id = null; localStorage.removeItem(key); }
+    }
+    if (!id) {
+      const s = await api('/api/files/upload/session', {
+        method: 'POST',
+        body: { path: state.path, name: file.name, size: file.size }
+      });
+      id = s.id;
+      localStorage.setItem(key, id);
+      offset = 0;
+    }
+    while (offset < file.size) {
+      const end = Math.min(offset + CHUNK_SIZE, file.size);
+      const chunk = file.slice(offset, end);
+      const res = await putChunkWithRetry(id, offset, chunk);
+      if (res.status === 409) { offset = res.offset; continue; } // re-sync to server
+      offset = res.offset;
+      setUploadProgress(offset, file.size);
+    }
+    await api('/api/files/upload/session/' + id + '/complete', { method: 'POST' });
+    localStorage.removeItem(key);
+    $('upload-title').textContent = 'Upload complete';
+    toast('Uploaded ' + file.name);
+    setTimeout(() => $('upload-panel').classList.add('hidden'), 1600);
+  } catch (err) {
+    $('upload-title').textContent = 'Upload paused';
+    $('upload-detail').textContent = 'Will resume if you upload it again.';
+    toast(err.message || 'Upload interrupted — retry to resume.', true);
+  }
+}
+
+async function putChunkWithRetry(id, offset, chunk, tries = 4) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch('/api/files/upload/session/' + id + '?offset=' + offset, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 409) return { status: 409, offset: data.offset };
+      if (!res.ok) throw new Error(data.error || 'Chunk upload failed.');
+      return { status: 200, offset: data.offset };
+    } catch (err) {
+      if (attempt >= tries) throw err;
+      await new Promise(r => setTimeout(r, 500 * (attempt + 1))); // backoff then retry
+    }
+  }
 }
 $('upload-close').addEventListener('click', () => $('upload-panel').classList.add('hidden'));
 
