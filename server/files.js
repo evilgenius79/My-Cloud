@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'crypto';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -6,10 +7,18 @@ import Busboy from 'busboy';
 import archiver from 'archiver';
 import mime from 'mime-types';
 import { userDirs } from './auth.js';
+import { withLock } from './locks.js';
 import {
   safeJoin, validName, listDir, dirSize, uniqueName,
   copyRecursive, moveEntry, searchFiles, statEntry
 } from './fsutil.js';
+
+const MAX_UPLOAD_FILES = 10000;
+const MAX_ZIP_ENTRIES = 10000;
+
+function trashId() {
+  return Date.now() + '-' + crypto.randomBytes(5).toString('hex');
+}
 
 export const filesRouter = express.Router();
 
@@ -93,6 +102,7 @@ filesRouter.get('/download', wrap(async (req, res) => {
 filesRouter.post('/zip', wrap(async (req, res) => {
   const { dir, names } = req.body;
   if (!Array.isArray(names) || names.length === 0) return res.status(400).json({ error: 'Nothing selected.' });
+  if (names.length > MAX_ZIP_ENTRIES) return res.status(400).json({ error: 'Too many items selected.' });
   const dirAbs = safeJoin(root(req), dir);
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent('files.zip')}`);
@@ -118,78 +128,109 @@ async function quotaRemaining(req) {
 }
 
 filesRouter.post('/upload', wrap(async (req, res) => {
-  const destDir = safeJoin(root(req), req.query.path);
+  const filesRoot = root(req);
+  const destDir = safeJoin(filesRoot, req.query.path);
   const st = await fsp.stat(destDir).catch(() => null);
   if (!st || !st.isDirectory()) return res.status(400).json({ error: 'Destination folder not found.' });
 
-  let remaining = await quotaRemaining(req);
-  const busboy = Busboy({ headers: req.headers });
-  const saved = [];
-  const pending = [];
-  let aborted = false;
+  const quotaBytes = (req.user.quotaMB || 0) * 1024 * 1024; // 0 = unlimited
+  // Serialize per user so concurrent uploads can't each see the full free
+  // quota and collectively exceed it.
+  await withLock('quota:' + req.user.username, () => new Promise(resolve => {
+    let usedStart = 0;
+    let projected = 0;      // committed + in-flight bytes this request
+    let quotaExceeded = false;
+    let tooMany = false;
+    let fileCount = 0;
+    let responded = false;
+    const saved = [];
+    const pending = [];
+    const open = new Set(); // { out, tmp } records still writing, for abort cleanup
 
-  busboy.on('file', (field, stream, info) => {
-    // Client may send files under subfolder-relative names (folder upload).
-    const relName = String(info.filename || 'unnamed').replace(/\\/g, '/');
-    const parts = relName.split('/').filter(p => p && p !== '.' && p !== '..');
-    if (parts.length === 0 || parts.some(p => !validName(p))) {
-      stream.resume();
-      return;
-    }
-    const fileName = parts.pop();
-    let dir;
-    try {
-      dir = parts.length ? safeJoin(destDir, parts.join('/')) : destDir;
-    } catch {
-      stream.resume();
-      return;
-    }
-    fs.mkdirSync(dir, { recursive: true });
-    const finalName = uniqueName(dir, fileName);
-    const target = path.join(dir, finalName);
-    const tmp = target + '.uploading';
-    const out = fs.createWriteStream(tmp);
-    let written = 0;
+    const respond = () => {
+      if (responded) return;
+      responded = true;
+      if (quotaExceeded) res.status(413).json({ error: 'Storage quota exceeded.', saved });
+      else if (tooMany) res.status(413).json({ error: 'Too many files in one upload.', saved });
+      else res.json({ saved });
+      resolve();
+    };
 
-    const done = new Promise(resolve => {
-      stream.on('data', chunk => {
-        written += chunk.length;
-        if (written > remaining) {
-          aborted = true;
-          stream.unpipe(out);
-          out.destroy();
-          fs.rm(tmp, { force: true }, () => {});
-          stream.resume();
-          resolve();
-        }
-      });
-      out.on('close', () => {
-        if (!aborted && fs.existsSync(tmp)) {
+    dirSize(filesRoot).catch(() => 0).then(used => {
+      usedStart = used || 0;
+      const busboy = Busboy({ headers: req.headers });
+
+      busboy.on('file', (field, stream, info) => {
+        pending.push(new Promise(doneFile => {
+          let rec = null;
+          let fileAborted = false;
+          const cleanup = () => { if (rec) { open.delete(rec); rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); } };
           try {
-            fs.renameSync(tmp, target);
-            remaining -= written;
-            saved.push(parts.length ? parts.join('/') + '/' + finalName : finalName);
-          } catch { /* leave tmp for cleanup */ }
-        }
-        resolve();
-      });
-      out.on('error', () => {
-        fs.rm(tmp, { force: true }, () => {});
-        resolve();
-      });
-      stream.on('error', () => resolve());
-    });
-    pending.push(done);
-    stream.pipe(out);
-  });
+            if (++fileCount > MAX_UPLOAD_FILES) { tooMany = true; stream.resume(); return doneFile(); }
+            // Client may send files under subfolder-relative names (folder upload).
+            const relName = String(info.filename || 'unnamed').replace(/\\/g, '/');
+            const parts = relName.split('/').filter(p => p && p !== '.' && p !== '..');
+            if (parts.length === 0 || parts.some(p => !validName(p))) { stream.resume(); return doneFile(); }
+            const fileName = parts.pop();
+            const dir = parts.length ? safeJoin(destDir, parts.join('/')) : destDir;
+            fs.mkdirSync(dir, { recursive: true });
+            const tmp = path.join(dir, '.' + crypto.randomBytes(8).toString('hex') + '.uploading');
+            const out = fs.createWriteStream(tmp);
+            rec = { out, tmp };
+            open.add(rec);
 
-  busboy.on('close', async () => {
-    await Promise.all(pending);
-    if (aborted) return res.status(413).json({ error: 'Storage quota exceeded.', saved });
-    res.json({ saved });
-  });
-  busboy.on('error', () => res.status(400).json({ error: 'Upload failed.' }));
-  req.pipe(busboy);
+            stream.on('data', chunk => {
+              projected += chunk.length;
+              if (quotaBytes && usedStart + projected > quotaBytes) {
+                quotaExceeded = true;
+                fileAborted = true;
+                stream.unpipe(out);
+                out.destroy();
+                stream.resume();
+              }
+            });
+            out.on('close', () => {
+              open.delete(rec);
+              if (fileAborted) { fs.rm(tmp, { force: true }, () => {}); return doneFile(); }
+              try {
+                // Pick a free name now, at commit time, so two same-named files
+                // in one request don't clobber each other.
+                const finalName = uniqueName(dir, fileName);
+                fs.renameSync(tmp, path.join(dir, finalName));
+                saved.push(parts.length ? parts.join('/') + '/' + finalName : finalName);
+              } catch { fs.rm(tmp, { force: true }, () => {}); }
+              doneFile();
+            });
+            out.on('error', () => { cleanup(); doneFile(); });
+            stream.on('error', () => { fileAborted = true; doneFile(); });
+            stream.pipe(out);
+          } catch {
+            // Any synchronous failure (mkdir on a name collision, createWriteStream,
+            // safeJoin) is contained here instead of crashing the whole process.
+            fileAborted = true;
+            cleanup();
+            stream.resume();
+            doneFile();
+          }
+        }));
+      });
+
+      busboy.on('close', async () => {
+        await Promise.all(pending);
+        respond();
+      });
+      busboy.on('error', () => {
+        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); }
+        if (!responded) { responded = true; res.status(400).json({ error: 'Upload failed.' }); resolve(); }
+      });
+      // Client aborted the connection mid-upload: drop the temp files.
+      req.on('aborted', () => {
+        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); }
+        if (!responded) { responded = true; resolve(); }
+      });
+      req.pipe(busboy);
+    });
+  }));
 }));
 
 filesRouter.post('/mkdir', wrap(async (req, res) => {
@@ -214,29 +255,52 @@ filesRouter.post('/rename', wrap(async (req, res) => {
 }));
 
 async function bulkTransfer(req, res, mode) {
+  const filesRoot = root(req);
   const { paths, dest } = req.body;
   if (!Array.isArray(paths) || paths.length === 0) return res.status(400).json({ error: 'Nothing selected.' });
-  const destAbs = safeJoin(root(req), dest);
+  const destAbs = safeJoin(filesRoot, dest);
   const destSt = await fsp.stat(destAbs).catch(() => null);
   if (!destSt || !destSt.isDirectory()) return res.status(400).json({ error: 'Destination folder not found.' });
-  const errors = [];
-  for (const p of paths) {
-    try {
-      const srcAbs = safeJoin(root(req), p);
-      if (srcAbs === root(req)) throw new Error('Invalid path.');
-      // Refuse moving/copying a folder into itself.
-      if (destAbs === srcAbs || destAbs.startsWith(srcAbs + path.sep)) {
-        throw new Error('Cannot ' + mode + ' a folder into itself.');
+
+  const run = async () => {
+    // Copying adds bytes, so enforce quota; moving within the same root doesn't.
+    if (mode === 'copy') {
+      const remaining = await quotaRemaining(req);
+      if (remaining !== Infinity) {
+        let needed = 0;
+        for (const p of paths) {
+          const srcAbs = safeJoin(filesRoot, p);
+          const stat = await fsp.lstat(srcAbs).catch(() => null);
+          if (stat) needed += stat.isDirectory() ? await dirSize(srcAbs) : stat.size;
+        }
+        if (needed > remaining) {
+          res.status(413).json({ error: 'Storage quota exceeded.' });
+          return;
+        }
       }
-      const name = uniqueName(destAbs, path.basename(srcAbs));
-      const target = path.join(destAbs, name);
-      if (mode === 'copy') await copyRecursive(srcAbs, target);
-      else await moveEntry(srcAbs, target);
-    } catch (err) {
-      errors.push({ path: p, error: err.message });
     }
-  }
-  res.json({ ok: errors.length === 0, errors });
+    const errors = [];
+    for (const p of paths) {
+      try {
+        const srcAbs = safeJoin(filesRoot, p);
+        if (srcAbs === filesRoot) throw new Error('Invalid path.');
+        // Refuse moving/copying a folder into itself or its own descendant.
+        if (destAbs === srcAbs || destAbs.startsWith(srcAbs + path.sep)) {
+          throw new Error('Cannot ' + mode + ' a folder into itself.');
+        }
+        const name = uniqueName(destAbs, path.basename(srcAbs));
+        const target = path.join(destAbs, name);
+        if (mode === 'copy') await copyRecursive(srcAbs, target);
+        else await moveEntry(srcAbs, target);
+      } catch (err) {
+        errors.push({ path: p, error: err.message });
+      }
+    }
+    res.json({ ok: errors.length === 0, errors });
+  };
+
+  // Copy/move affect quota accounting, so run under the per-user lock.
+  await withLock('quota:' + req.user.username, run);
 }
 
 filesRouter.post('/move', wrap((req, res) => bulkTransfer(req, res, 'move')));
@@ -255,14 +319,21 @@ filesRouter.post('/delete', wrap(async (req, res) => {
       const abs = safeJoin(root(req), p);
       if (abs === root(req)) throw new Error('Invalid path.');
       await fsp.stat(abs);
-      const id = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-      await moveEntry(abs, path.join(trash, id));
+      const id = trashId();
       const rel = path.relative(root(req), abs).split(path.sep).join('/');
+      // Write the meta sidecar BEFORE moving the data, so a crash never leaves
+      // orphaned, unrestorable, unpurgeable data in the trash.
       await fsp.writeFile(path.join(trash, id + '.meta.json'), JSON.stringify({
         originalPath: rel,
         name: path.basename(abs),
         deletedAt: Date.now()
       }));
+      try {
+        await moveEntry(abs, path.join(trash, id));
+      } catch (err) {
+        await fsp.rm(path.join(trash, id + '.meta.json'), { force: true });
+        throw err;
+      }
     } catch (err) {
       errors.push({ path: p, error: err.message });
     }
@@ -296,13 +367,21 @@ filesRouter.put('/content', express.text({ limit: '6mb', type: '*/*' }), wrap(as
   const abs = safeJoin(root(req), req.query.path);
   if (abs === root(req)) return res.status(400).json({ error: 'Invalid path.' });
   const body = typeof req.body === 'string' ? req.body : '';
-  const remaining = await quotaRemaining(req);
-  const existing = await fsp.stat(abs).catch(() => null);
-  if (existing && existing.isDirectory()) return res.status(400).json({ error: 'Not a file.' });
-  const delta = Buffer.byteLength(body) - (existing ? existing.size : 0);
-  if (delta > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
-  await fsp.writeFile(abs, body);
-  res.json({ ok: true });
+  if (Buffer.byteLength(body) > MAX_EDIT_SIZE) {
+    return res.status(413).json({ error: 'File too large to save (5 MB max).' });
+  }
+  await withLock('quota:' + req.user.username, async () => {
+    const remaining = await quotaRemaining(req);
+    const existing = await fsp.stat(abs).catch(() => null);
+    if (existing && existing.isDirectory()) return res.status(400).json({ error: 'Not a file.' });
+    const delta = Buffer.byteLength(body) - (existing ? existing.size : 0);
+    if (delta > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
+    // Atomic write so a crash mid-save can't truncate the user's file.
+    const tmp = abs + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+    await fsp.writeFile(tmp, body);
+    await fsp.rename(tmp, abs);
+    res.json({ ok: true });
+  });
 }));
 
 // --- Trash ---
@@ -331,23 +410,32 @@ trashRouter.post('/restore', wrap(async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'Nothing selected.' });
   const trash = trashRoot(req);
-  const errors = [];
-  for (const id of ids) {
-    try {
-      if (!validName(id)) throw new Error('Invalid id.');
-      const metaFile = path.join(trash, id + '.meta.json');
-      const meta = JSON.parse(await fsp.readFile(metaFile, 'utf8'));
-      const destAbs = safeJoin(root(req), meta.originalPath);
-      const destDir = path.dirname(destAbs);
-      fs.mkdirSync(destDir, { recursive: true });
-      const finalName = uniqueName(destDir, path.basename(destAbs));
-      await moveEntry(path.join(trash, id), path.join(destDir, finalName));
-      await fsp.rm(metaFile, { force: true });
-    } catch (err) {
-      errors.push({ id, error: err.message });
+  await withLock('quota:' + req.user.username, async () => {
+    let remaining = await quotaRemaining(req);
+    const errors = [];
+    for (const id of ids) {
+      try {
+        if (!validName(id)) throw new Error('Invalid id.');
+        const metaFile = path.join(trash, id + '.meta.json');
+        const meta = JSON.parse(await fsp.readFile(metaFile, 'utf8'));
+        const srcAbs = path.join(trash, id);
+        const stat = await fsp.lstat(srcAbs).catch(() => null);
+        if (!stat) throw new Error('Trashed item is missing.');
+        const size = stat.isDirectory() ? await dirSize(srcAbs) : stat.size;
+        if (size > remaining) throw new Error('Storage quota exceeded.');
+        const destAbs = safeJoin(root(req), meta.originalPath);
+        const destDir = path.dirname(destAbs);
+        fs.mkdirSync(destDir, { recursive: true });
+        const finalName = uniqueName(destDir, path.basename(destAbs));
+        await moveEntry(srcAbs, path.join(destDir, finalName));
+        await fsp.rm(metaFile, { force: true });
+        remaining -= size;
+      } catch (err) {
+        errors.push({ id, error: err.message });
+      }
     }
-  }
-  res.json({ ok: errors.length === 0, errors });
+    res.json({ ok: errors.length === 0, errors });
+  });
 }));
 
 trashRouter.post('/delete', wrap(async (req, res) => {
@@ -372,24 +460,52 @@ trashRouter.post('/empty', wrap(async (req, res) => {
 }));
 
 // Purge trash items older than retention. Called on a timer from index.js.
+// Retention 0 means "keep forever" for normal items, but we still sweep
+// orphaned data (data with no meta sidecar) so a crash mid-delete can't leak
+// space permanently.
 export async function purgeOldTrash(username, retentionDays) {
-  if (!retentionDays) return;
   const trash = userDirs(username).trash;
-  const cutoff = Date.now() - retentionDays * 86400000;
   let names;
   try {
     names = await fsp.readdir(trash);
   } catch {
     return;
   }
+  const metaIds = new Set(
+    names.filter(n => n.endsWith('.meta.json')).map(n => n.slice(0, -'.meta.json'.length))
+  );
+
+  // 1) Expire items whose meta says they're older than retention.
+  if (retentionDays > 0) {
+    const cutoff = Date.now() - retentionDays * 86400000;
+    for (const name of names) {
+      if (!name.endsWith('.meta.json')) continue;
+      const id = name.slice(0, -'.meta.json'.length);
+      try {
+        const meta = JSON.parse(await fsp.readFile(path.join(trash, name), 'utf8'));
+        if (meta.deletedAt < cutoff) {
+          await fsp.rm(path.join(trash, id), { recursive: true, force: true });
+          await fsp.rm(path.join(trash, name), { force: true });
+          metaIds.delete(id);
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  // 2) Sweep orphans: data files/dirs with no meta, and meta with no data.
+  //    Give a 1-hour grace so an in-progress delete isn't reaped mid-flight.
+  const orphanCutoff = Date.now() - 3600000;
   for (const name of names) {
-    if (!name.endsWith('.meta.json')) continue;
-    const id = name.slice(0, -'.meta.json'.length);
     try {
-      const meta = JSON.parse(await fsp.readFile(path.join(trash, name), 'utf8'));
-      if (meta.deletedAt < cutoff) {
-        await fsp.rm(path.join(trash, id), { recursive: true, force: true });
-        await fsp.rm(path.join(trash, name), { force: true });
+      if (name.endsWith('.meta.json')) {
+        const id = name.slice(0, -'.meta.json'.length);
+        if (!names.includes(id)) {
+          const st = await fsp.stat(path.join(trash, name)).catch(() => null);
+          if (st && st.mtimeMs < orphanCutoff) await fsp.rm(path.join(trash, name), { force: true });
+        }
+      } else if (!metaIds.has(name)) {
+        const st = await fsp.lstat(path.join(trash, name)).catch(() => null);
+        if (st && st.mtimeMs < orphanCutoff) await fsp.rm(path.join(trash, name), { recursive: true, force: true });
       }
     } catch { /* skip */ }
   }

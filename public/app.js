@@ -395,9 +395,8 @@ function selectedPaths() {
 async function downloadSelection() {
   const names = [...state.selected];
   if (names.length === 1) {
-    const entry = state.entries.find(e => e.name === names[0]);
     window.location.href = fileUrl(joinPath(state.path, names[0]), true);
-    return void entry;
+    return;
   }
   // Multi-select: server streams a zip from a POST via a temp form.
   const res = await fetch('/api/files/zip', {

@@ -49,7 +49,10 @@ export async function listDir(abs) {
   return entries;
 }
 
-export async function dirSize(abs) {
+const MAX_DEPTH = 40;
+
+export async function dirSize(abs, depth = 0) {
+  if (depth > MAX_DEPTH) return 0;
   let total = 0;
   let entries;
   try {
@@ -59,10 +62,12 @@ export async function dirSize(abs) {
   }
   for (const e of entries) {
     const p = path.join(abs, e.name);
-    if (e.isDirectory()) total += await dirSize(p);
+    // Only descend into real directories and size real files — never follow
+    // symlinks (avoids escaping the root and cycle blow-ups).
+    if (e.isDirectory()) total += await dirSize(p, depth + 1);
     else if (e.isFile()) {
       try {
-        total += (await fsp.stat(p)).size;
+        total += (await fsp.lstat(p)).size;
       } catch { /* vanished */ }
     }
   }
@@ -102,8 +107,8 @@ export async function moveEntry(src, dest) {
 export async function searchFiles(root, query, limit = 200) {
   const q = query.toLowerCase();
   const results = [];
-  async function walk(dir, rel) {
-    if (results.length >= limit) return;
+  async function walk(dir, rel, depth) {
+    if (results.length >= limit || depth > MAX_DEPTH) return;
     let entries;
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -118,9 +123,9 @@ export async function searchFiles(root, query, limit = 200) {
           results.push({ path: childRel, ...(await statEntry(path.join(dir, e.name), e.name)) });
         } catch { /* vanished */ }
       }
-      if (e.isDirectory()) await walk(path.join(dir, e.name), childRel);
+      if (e.isDirectory()) await walk(path.join(dir, e.name), childRel, depth + 1);
     }
   }
-  await walk(root, '');
+  await walk(root, '', 0);
   return results;
 }

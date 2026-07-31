@@ -5,7 +5,7 @@ import path from 'path';
 import { DATA_DIR, secret, settings } from './config.js';
 import { JsonStore } from './store.js';
 
-const usersStore = new JsonStore('users.json', { users: [] });
+const usersStore = new JsonStore('users.json', { users: [] }, { critical: true });
 
 export function listUsers() {
   return usersStore.data.users;
@@ -29,12 +29,14 @@ export function createUser({ username, password, isAdmin = false, quotaMB = null
   }
   if (findUser(username)) throw new Error('User already exists.');
   if (!password || String(password).length < 6) throw new Error('Password must be at least 6 characters.');
+  const now = Date.now();
   const user = {
     username,
     passwordHash: bcrypt.hashSync(String(password), 10),
     isAdmin: !!isAdmin,
-    quotaMB: quotaMB === null || quotaMB === undefined ? settings.defaultQuotaMB : Number(quotaMB) || 0,
-    createdAt: Date.now()
+    quotaMB: quotaMB === null || quotaMB === undefined ? settings.defaultQuotaMB : Math.max(0, Number(quotaMB) || 0),
+    createdAt: now,
+    passwordChangedAt: now
   };
   usersStore.data.users.push(user);
   usersStore.save();
@@ -50,9 +52,11 @@ export function updateUser(username, patch) {
   if (patch.password !== undefined && patch.password !== '') {
     if (String(patch.password).length < 6) throw new Error('Password must be at least 6 characters.');
     user.passwordHash = bcrypt.hashSync(String(patch.password), 10);
+    // Invalidate any existing session tokens issued before this change.
+    user.passwordChangedAt = Date.now();
   }
   if (patch.isAdmin !== undefined) user.isAdmin = !!patch.isAdmin;
-  if (patch.quotaMB !== undefined) user.quotaMB = Number(patch.quotaMB) || 0;
+  if (patch.quotaMB !== undefined) user.quotaMB = Math.max(0, Number(patch.quotaMB) || 0);
   usersStore.save();
   return user;
 }
@@ -83,8 +87,10 @@ function hmac(data) {
 }
 
 export function makeSessionToken(username) {
+  const user = findUser(username);
   const payload = Buffer.from(JSON.stringify({
     u: username,
+    pv: user?.passwordChangedAt || 0,
     exp: Date.now() + settings.sessionDays * 86400000
   })).toString('base64url');
   return payload + '.' + hmac(payload);
@@ -103,7 +109,11 @@ export function verifySessionToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!data.u || Date.now() > data.exp) return null;
-    return findUser(data.u) || null;
+    const user = findUser(data.u);
+    if (!user) return null;
+    // Reject tokens issued before the user's last password change.
+    if ((data.pv || 0) !== (user.passwordChangedAt || 0)) return null;
+    return user;
   } catch {
     return null;
   }
@@ -120,9 +130,11 @@ function getCookie(req, name) {
   return null;
 }
 
-export function sessionCookie(token) {
+export function sessionCookie(token, secure = false) {
   const maxAge = settings.sessionDays * 86400;
-  return `mycloud_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+  // Secure is added only when the request arrived over HTTPS, so HTTP-only
+  // LAN installs (common on Unraid) still work while HTTPS installs get it.
+  return `mycloud_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
 }
 
 export const clearSessionCookie = 'mycloud_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0';
@@ -141,13 +153,19 @@ export function adminMiddleware(req, res, next) {
 
 // --- Login rate limiting (in-memory, per IP) ---
 const attempts = new Map();
+const WINDOW_MS = 15 * 60000;
 export function loginRateLimit(req, res, next) {
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
-  const entry = attempts.get(ip) || { count: 0, resetAt: now + 15 * 60000 };
+  // Opportunistically drop expired buckets so the map can't grow unbounded
+  // under a spray of distinct source IPs.
+  if (attempts.size > 5000) {
+    for (const [k, v] of attempts) if (now > v.resetAt) attempts.delete(k);
+  }
+  const entry = attempts.get(ip) || { count: 0, resetAt: now + WINDOW_MS };
   if (now > entry.resetAt) {
     entry.count = 0;
-    entry.resetAt = now + 15 * 60000;
+    entry.resetAt = now + WINDOW_MS;
   }
   if (entry.count >= 20) {
     return res.status(429).json({ error: 'Too many login attempts. Try again later.' });

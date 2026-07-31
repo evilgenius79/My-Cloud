@@ -40,7 +40,11 @@ if (fs.existsSync(settingsFile)) {
 
 export function saveSettings(patch) {
   settings = { ...settings, ...patch };
-  fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
+  // Atomic write so a crash mid-save can't corrupt settings.json (which would
+  // silently reset the site name/quota/retention to defaults on next boot).
+  const tmp = settingsFile + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
+  fs.renameSync(tmp, settingsFile);
   return settings;
 }
 

@@ -12,9 +12,14 @@ import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
 import { dirSize } from './fsutil.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', true);
+// Trust only private/loopback proxies (a reverse proxy on the LAN), NOT
+// arbitrary clients — otherwise a remote caller could spoof X-Forwarded-For
+// to forge req.ip and bypass the login rate-limiter. Override with
+// MYCLOUD_TRUST_PROXY (e.g. a hop count) for unusual topologies.
+app.set('trust proxy', process.env.MYCLOUD_TRUST_PROXY || 'loopback, linklocal, uniquelocal');
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -35,7 +40,7 @@ app.post('/api/setup', express.json(), (req, res) => {
   if (!needsSetup()) return res.status(403).json({ error: 'Setup already completed.' });
   try {
     const user = createUser({ username: req.body.username, password: req.body.password, isAdmin: true });
-    res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username)));
+    res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username), req.secure));
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -45,7 +50,7 @@ app.post('/api/setup', express.json(), (req, res) => {
 app.post('/api/auth/login', loginRateLimit, express.json(), (req, res) => {
   const user = verifyPassword(req.body.username, req.body.password);
   if (!user) return res.status(403).json({ error: 'Wrong username or password.' });
-  res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username)));
+  res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username), req.secure));
   res.json({ ok: true });
 });
 
@@ -88,7 +93,7 @@ app.use('/s', publicRouter);
 const admin = express.Router();
 admin.use(authMiddleware, adminMiddleware, express.json({ limit: '1mb' }));
 
-admin.get('/users', async (req, res) => {
+admin.get('/users', wrap(async (req, res) => {
   const users = [];
   for (const u of listUsers()) {
     let used = 0;
@@ -104,7 +109,7 @@ admin.get('/users', async (req, res) => {
     });
   }
   res.json({ users });
-});
+}));
 
 admin.post('/users', (req, res) => {
   try {
@@ -143,11 +148,14 @@ admin.delete('/users/:username', (req, res) => {
 });
 
 admin.get('/settings', (req, res) => res.json({ settings }));
+const clampNonNeg = v => Math.max(0, Math.floor(Number(v) || 0));
 admin.patch('/settings', (req, res) => {
   const patch = {};
   if (typeof req.body.siteName === 'string' && req.body.siteName.trim()) patch.siteName = req.body.siteName.trim().slice(0, 60);
-  if (req.body.defaultQuotaMB !== undefined) patch.defaultQuotaMB = Number(req.body.defaultQuotaMB) || 0;
-  if (req.body.trashRetentionDays !== undefined) patch.trashRetentionDays = Number(req.body.trashRetentionDays) || 0;
+  // Clamp to >= 0: a negative retention would flip the purge cutoff into the
+  // future and wipe all trash; a negative quota would reject every upload.
+  if (req.body.defaultQuotaMB !== undefined) patch.defaultQuotaMB = clampNonNeg(req.body.defaultQuotaMB);
+  if (req.body.trashRetentionDays !== undefined) patch.trashRetentionDays = clampNonNeg(req.body.trashRetentionDays);
   res.json({ settings: saveSettings(patch) });
 });
 
