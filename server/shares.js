@@ -1,15 +1,17 @@
 import express from 'express';
 import crypto from 'crypto';
-import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import bcrypt from 'bcryptjs';
-import Busboy from 'busboy';
 import { JsonStore } from './store.js';
 import { userDirs, authMiddleware, findUser } from './auth.js';
-import { safeJoin, listDir, dirSize, uniqueName, validName } from './fsutil.js';
+import { safeJoin, listDir, realContained } from './fsutil.js';
 import { withLock } from './locks.js';
-import { sendFile, sendZip } from './files.js';
+import { sendFile, sendZip, streamUpload, isMultipart } from './files.js';
+
+// Absolute cap on a single anonymous drop-box upload request, independent of
+// the owner's quota (which may be unlimited). Prevents disk-fill via shares.
+const MAX_PUBLIC_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
 const sharesStore = new JsonStore('shares.json', { shares: [] });
 
@@ -146,7 +148,8 @@ publicRouter.post('/api/:token/unlock', express.json(), wrap(async (req, res) =>
     return res.status(403).json({ error: 'Wrong password.' });
   }
   const val = crypto.createHmac('sha256', share.passwordHash).update(share.token).digest('hex');
-  res.setHeader('Set-Cookie', `${shareCookieName(share.token)}=${val}; Path=/; HttpOnly; SameSite=Lax`);
+  const secure = req.secure || /^(1|true|yes)$/i.test(process.env.MYCLOUD_FORCE_SECURE_COOKIE || '') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${shareCookieName(share.token)}=${val}; Path=/; HttpOnly; SameSite=Lax${secure}`);
   res.json({ ok: true });
 }));
 
@@ -165,8 +168,11 @@ publicRouter.get('/api/:token/download', wrap(async (req, res) => {
   const share = loadShare(req, res);
   if (!share) return;
   if (!shareUnlocked(req, share)) return res.status(403).json({ error: 'Password required.' });
-  let abs = shareAbs(share);
+  const shareRoot = shareAbs(share);
+  let abs = shareRoot;
   if (share.isDir && req.query.path) abs = safeJoin(abs, req.query.path);
+  // Refuse symlinks resolving outside the shared folder.
+  if (!await realContained(shareRoot, abs)) return res.status(404).json({ error: 'File not found.' });
   const st = await fsp.stat(abs).catch(() => null);
   if (!st) return res.status(404).json({ error: 'File not found.' });
   // Count a download once per file fetch — not per HTTP range request (video
@@ -176,7 +182,8 @@ publicRouter.get('/api/:token/download', wrap(async (req, res) => {
     share.downloads = (share.downloads || 0) + 1;
     scheduleSharesSave();
   }
-  if (st.isDirectory()) return sendZip(res, abs, (path.basename(abs) || 'share') + '.zip');
+  // level 0 (store) for public zips: cheaper CPU, and media is already compressed.
+  if (st.isDirectory()) return sendZip(res, abs, (path.basename(abs) || 'share') + '.zip', { level: 0 });
   sendFile(req, res, abs, { download: req.query.dl !== '0' });
 }));
 
@@ -186,7 +193,7 @@ publicRouter.post('/api/:token/upload', wrap(async (req, res) => {
   if (!share) return;
   if (!shareUnlocked(req, share)) return res.status(403).json({ error: 'Password required.' });
   if (!share.isDir || !share.allowUpload) return res.status(403).json({ error: 'Uploads not allowed on this share.' });
-  const ownerRoot = userDirs(share.owner).files;
+  if (!isMultipart(req)) return res.status(400).json({ error: 'Expected a multipart upload.' });
   // Honor whatever subfolder the visitor navigated into, bounded to the share.
   const destDir = req.query.path ? safeJoin(shareAbs(share), req.query.path) : shareAbs(share);
   const dst = await fsp.stat(destDir).catch(() => null);
@@ -194,85 +201,14 @@ publicRouter.post('/api/:token/upload', wrap(async (req, res) => {
 
   const owner = findUser(share.owner);
   const quotaBytes = (owner?.quotaMB || 0) * 1024 * 1024; // 0 = unlimited
-
-  // Serialize against the owner's other quota-affecting writes.
-  await withLock('quota:' + share.owner, () => new Promise(resolve => {
-    let responded = false;
-    const respond = (status, body) => {
-      if (responded) return;
-      responded = true;
-      res.status(status).json(body);
-      resolve();
-    };
-    dirSize(ownerRoot).catch(() => 0).then(used => {
-      const usedStart = used || 0;
-      let projected = 0;
-      let quotaExceeded = false;
-      let fileCount = 0;
-      let tooMany = false;
-      const saved = [];
-      const pending = [];
-      const open = new Set();
-      const busboy = Busboy({ headers: req.headers });
-
-      busboy.on('file', (field, stream, info) => {
-        pending.push(new Promise(doneFile => {
-          let rec = null;
-          let fileAborted = false;
-          try {
-            if (++fileCount > 10000) { tooMany = true; stream.resume(); return doneFile(); }
-            const name = path.basename(String(info.filename || ''));
-            if (!validName(name)) { stream.resume(); return doneFile(); }
-            const tmp = path.join(destDir, '.' + crypto.randomBytes(8).toString('hex') + '.uploading');
-            const out = fs.createWriteStream(tmp);
-            rec = { out, tmp };
-            open.add(rec);
-            stream.on('data', chunk => {
-              projected += chunk.length;
-              if (quotaBytes && usedStart + projected > quotaBytes) {
-                quotaExceeded = true;
-                fileAborted = true;
-                stream.unpipe(out);
-                out.destroy();
-                stream.resume();
-              }
-            });
-            out.on('close', () => {
-              open.delete(rec);
-              if (fileAborted) { fs.rm(tmp, { force: true }, () => {}); return doneFile(); }
-              try {
-                const finalName = uniqueName(destDir, name);
-                fs.renameSync(tmp, path.join(destDir, finalName));
-                saved.push(finalName);
-              } catch { fs.rm(tmp, { force: true }, () => {}); }
-              doneFile();
-            });
-            out.on('error', () => { open.delete(rec); fs.rm(tmp, { force: true }, () => {}); doneFile(); });
-            stream.on('error', () => { fileAborted = true; doneFile(); });
-            stream.pipe(out);
-          } catch {
-            fileAborted = true;
-            if (rec) { open.delete(rec); fs.rm(rec.tmp, { force: true }, () => {}); }
-            stream.resume();
-            doneFile();
-          }
-        }));
-      });
-      busboy.on('close', async () => {
-        await Promise.all(pending);
-        if (quotaExceeded) return respond(413, { error: 'The owner is out of storage space.', saved });
-        if (tooMany) return respond(413, { error: 'Too many files in one upload.', saved });
-        respond(200, { saved });
-      });
-      busboy.on('error', () => {
-        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } fs.rm(rec.tmp, { force: true }, () => {}); }
-        respond(400, { error: 'Upload failed.' });
-      });
-      req.on('aborted', () => {
-        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } fs.rm(rec.tmp, { force: true }, () => {}); }
-        if (!responded) { responded = true; resolve(); }
-      });
-      req.pipe(busboy);
-    });
+  // Uploads land in the share root, no client subpaths; enforce the owner's
+  // quota AND an absolute cap so an anonymous visitor can't fill the disk.
+  await withLock('quota:' + share.owner, () => streamUpload(req, res, {
+    username: share.owner,
+    destDir,
+    allowSubdirs: false,
+    quotaBytes,
+    maxBytes: MAX_PUBLIC_UPLOAD_BYTES,
+    outOfSpaceMsg: 'The owner is out of storage space.'
   }));
 }));

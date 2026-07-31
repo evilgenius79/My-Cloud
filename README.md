@@ -57,12 +57,17 @@ npm run dev        # stores state in ./dev-config and ./dev-data
 ## Configuration
 
 | Environment variable  | Default   | Purpose                                  |
-| --------------------- | --------- | ---------------------------------------- |
-| `MYCLOUD_CONFIG_DIR`  | `/config` | Settings, users, shares, session secret  |
-| `MYCLOUD_DATA_DIR`    | `/data`   | User files (`users/<name>/files`)        |
-| `MYCLOUD_PORT`        | `8686`    | HTTP port                                |
+| Environment variable         | Default   | Purpose                                                        |
+| ---------------------------- | --------- | -------------------------------------------------------------- |
+| `MYCLOUD_CONFIG_DIR`         | `/config` | Settings, users, shares, session secret                        |
+| `MYCLOUD_DATA_DIR`           | `/data`   | User files (`users/<name>/files`)                              |
+| `MYCLOUD_PORT`               | `8686`    | HTTP port                                                      |
+| `PUID` / `PGID`              | `99`/`100`| User/group that owns created files (Unraid `nobody:users`)     |
+| `UMASK`                      | `022`     | Permission mask for created files                              |
+| `MYCLOUD_TRUST_PROXY`        | private   | Which proxies to trust for client IP. Defaults to loopback/private ranges; set to a hop count (e.g. `1`) only if you know your proxy chain. **Never set to `true` on an internet-exposed install** — it lets clients spoof their IP and defeat the login rate-limiter. |
+| `MYCLOUD_FORCE_SECURE_COOKIE`| off       | Set to `1` to force the `Secure` cookie flag when TLS is terminated at a proxy that doesn't send `X-Forwarded-Proto`. |
 
-Runtime settings (site name, default quota, trash retention) are editable from the **Admin** page in the UI.
+The container runs as a non-root user (`PUID:PGID`) and fixes ownership of `/config` and `/data` on first start. Runtime settings (site name, default quota, trash retention) are editable from the **Admin** page in the UI.
 
 ## How data is laid out
 
@@ -84,10 +89,13 @@ Backing up My Cloud = backing up those two folders. Restoring = putting them bac
 
 ## Security notes
 
-- Passwords are stored bcrypt-hashed; sessions are HMAC-signed HTTP-only cookies.
-- Login attempts are rate-limited per IP.
-- All file paths are validated server-side against directory traversal.
-- **Use HTTPS** if you expose this to the internet — put it behind a reverse proxy (Nginx Proxy Manager, SWAG, Traefik, Caddy) with a TLS certificate. Cookies are `SameSite=Lax`/`HttpOnly` but only as safe as the transport.
+- Passwords are stored bcrypt-hashed; sessions are HMAC-signed `HttpOnly` cookies, revoked on password change.
+- Login attempts are rate-limited per IP **and per username** (so an IP-rotating spray against one account is still throttled); the whole public share surface is rate-limited too.
+- All file paths are validated server-side against directory traversal, and download paths reject symlinks that resolve outside your area.
+- Storage quotas are enforced on uploads (including anonymous drop-box shares), copies, and restores; trash counts toward quota.
+- Uploaded HTML/SVG is served sandboxed (`Content-Security-Policy: sandbox`, `X-Content-Type-Options: nosniff`) so it can't script against the app.
+- The container runs as a non-root user; images are published with build provenance and an SBOM.
+- **Use HTTPS** if you expose this to the internet — put it behind a reverse proxy (Nginx Proxy Manager, SWAG, Traefik, Caddy) with a TLS certificate, and make sure it forwards `X-Forwarded-Proto` (or set `MYCLOUD_FORCE_SECURE_COOKIE=1`). Cookies are `SameSite=Lax`/`HttpOnly` but only as safe as the transport.
 
 ## Roadmap ideas
 

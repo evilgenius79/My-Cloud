@@ -16,6 +16,18 @@ export function safeJoin(root, relPath) {
   return resolved;
 }
 
+// Resolve symlinks and confirm the real target is still inside root. safeJoin
+// only guards the lexical path; this catches a symlink placed out-of-band (e.g.
+// via SMB into /data) that points outside the user's area. Returns the real
+// path if contained, else null.
+export async function realContained(root, abs) {
+  try {
+    const [realRoot, realAbs] = await Promise.all([fsp.realpath(root), fsp.realpath(abs)]);
+    if (realAbs === realRoot || realAbs.startsWith(realRoot + path.sep)) return realAbs;
+  } catch { /* missing target */ }
+  return null;
+}
+
 export function validName(name) {
   if (typeof name !== 'string' || name.length === 0 || name.length > 255) return false;
   if (name === '.' || name === '..') return false;

@@ -130,11 +130,16 @@ function getCookie(req, name) {
   return null;
 }
 
+// Operators terminating TLS at a proxy that doesn't forward X-Forwarded-Proto
+// can force the Secure flag with MYCLOUD_FORCE_SECURE_COOKIE=1.
+const FORCE_SECURE_COOKIE = /^(1|true|yes)$/i.test(process.env.MYCLOUD_FORCE_SECURE_COOKIE || '');
+
 export function sessionCookie(token, secure = false) {
   const maxAge = settings.sessionDays * 86400;
-  // Secure is added only when the request arrived over HTTPS, so HTTP-only
-  // LAN installs (common on Unraid) still work while HTTPS installs get it.
-  return `mycloud_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+  // Secure is added when the request arrived over HTTPS (or forced), so
+  // HTTP-only LAN installs (common on Unraid) still work while HTTPS gets it.
+  const flag = secure || FORCE_SECURE_COOKIE ? '; Secure' : '';
+  return `mycloud_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${flag}`;
 }
 
 export const clearSessionCookie = 'mycloud_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0';
@@ -151,26 +156,74 @@ export function adminMiddleware(req, res, next) {
   next();
 }
 
-// --- Login rate limiting (in-memory, per IP) ---
-const attempts = new Map();
+// --- Login rate limiting (in-memory) ---
+// Two independent buckets: per-IP (stops a single host hammering) and
+// per-username (stops a distributed IP-rotation spray against one account,
+// which per-IP limiting alone can't catch on IPv6 / botnets).
 const WINDOW_MS = 15 * 60000;
-export function loginRateLimit(req, res, next) {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+const MAX_PER_IP = 20;
+const MAX_PER_USER = 10;
+const ipAttempts = new Map();
+const userAttempts = new Map();
+
+function bump(map, key, max, now) {
+  let e = map.get(key);
+  if (!e || now > e.resetAt) e = { count: 0, resetAt: now + WINDOW_MS };
+  e.count++;
+  map.set(key, e);
+  return e.count > max;
+}
+
+// Cleared on a successful login so a legitimate user isn't locked out by
+// their own earlier typos.
+export function clearLoginAttempts(username) {
+  if (username) userAttempts.delete(String(username).toLowerCase().trim());
+}
+
+// Periodic sweep off the hot path so the maps can't grow unbounded and
+// login requests never pay an O(n) scan.
+setInterval(() => {
   const now = Date.now();
-  // Opportunistically drop expired buckets so the map can't grow unbounded
-  // under a spray of distinct source IPs.
-  if (attempts.size > 5000) {
-    for (const [k, v] of attempts) if (now > v.resetAt) attempts.delete(k);
+  for (const m of [ipAttempts, userAttempts]) {
+    for (const [k, v] of m) if (now > v.resetAt) m.delete(k);
   }
-  const entry = attempts.get(ip) || { count: 0, resetAt: now + WINDOW_MS };
-  if (now > entry.resetAt) {
-    entry.count = 0;
-    entry.resetAt = now + WINDOW_MS;
+}, WINDOW_MS).unref?.();
+
+export function loginRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const username = String(req.body?.username || '').toLowerCase().trim();
+  const ipBlocked = bump(ipAttempts, ip, MAX_PER_IP, now);
+  const userBlocked = username && bump(userAttempts, username, MAX_PER_USER, now);
+  if (ipBlocked || userBlocked) {
+    return res.status(429).json({ error: 'Too many login attempts. Try again in a few minutes.' });
   }
-  if (entry.count >= 20) {
-    return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
-  }
-  entry.count++;
-  attempts.set(ip, entry);
   next();
+}
+
+// General-purpose per-IP limiter for the public (unauthenticated) share surface.
+// Buckets by IPv6 /64 so a single allocation can't rotate addresses freely.
+const publicBuckets = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of publicBuckets) if (now > v.resetAt) publicBuckets.delete(k);
+}, 60000).unref?.();
+
+function ipKey(req) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (ip.includes(':')) return ip.split(':').slice(0, 4).join(':'); // IPv6 /64
+  return ip;
+}
+
+export function publicRateLimit({ max = 120, windowMs = 60000 } = {}) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = ipKey(req);
+    let e = publicBuckets.get(key);
+    if (!e || now > e.resetAt) e = { count: 0, resetAt: now + windowMs };
+    e.count++;
+    publicBuckets.set(key, e);
+    if (e.count > max) return res.status(429).json({ error: 'Too many requests. Slow down.' });
+    next();
+  };
 }

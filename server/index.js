@@ -5,7 +5,7 @@ import { PORT, settings, saveSettings } from './config.js';
 import {
   listUsers, findUser, createUser, updateUser, deleteUser, verifyPassword,
   makeSessionToken, sessionCookie, clearSessionCookie,
-  authMiddleware, adminMiddleware, loginRateLimit, userDirs
+  authMiddleware, adminMiddleware, loginRateLimit, clearLoginAttempts, publicRateLimit, userDirs
 } from './auth.js';
 import { filesRouter, trashRouter, purgeOldTrash } from './files.js';
 import { sharesRouter, publicRouter, deleteSharesForUser } from './shares.js';
@@ -47,9 +47,11 @@ app.post('/api/setup', express.json(), (req, res) => {
   }
 });
 
-app.post('/api/auth/login', loginRateLimit, express.json(), (req, res) => {
+// express.json first so the per-username rate-limit bucket can read the body.
+app.post('/api/auth/login', express.json(), loginRateLimit, (req, res) => {
   const user = verifyPassword(req.body.username, req.body.password);
   if (!user) return res.status(403).json({ error: 'Wrong username or password.' });
+  clearLoginAttempts(user.username);
   res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(user.username), req.secure));
   res.json({ ok: true });
 });
@@ -75,6 +77,9 @@ app.post('/api/auth/password', authMiddleware, express.json(), (req, res) => {
   }
   try {
     updateUser(req.user.username, { password: nextPw });
+    // Changing the password bumps passwordChangedAt, which invalidates the
+    // current token — re-issue one so the user isn't logged out of this session.
+    res.setHeader('Set-Cookie', sessionCookie(makeSessionToken(req.user.username), req.secure));
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -86,7 +91,11 @@ app.post('/api/auth/password', authMiddleware, express.json(), (req, res) => {
 app.use('/api/files', authMiddleware, express.json({ limit: '1mb' }), filesRouter);
 app.use('/api/trash', authMiddleware, express.json({ limit: '1mb' }), trashRouter);
 app.use('/api/shares', express.json({ limit: '1mb' }), sharesRouter);
-app.use('/s', publicRouter);
+// Rate-limit the unauthenticated share surface. Tighter budget for the
+// expensive zip/upload paths; looser for info/list/download of single files.
+app.use('/s/api/:token/upload', publicRateLimit({ max: 30, windowMs: 60000 }));
+app.use('/s/api/:token/download', publicRateLimit({ max: 60, windowMs: 60000 }));
+app.use('/s', publicRateLimit({ max: 240, windowMs: 60000 }), publicRouter);
 
 // --- Admin ---
 
@@ -123,8 +132,15 @@ admin.post('/users', (req, res) => {
 admin.patch('/users/:username', (req, res) => {
   const target = findUser(req.params.username);
   if (!target) return res.status(404).json({ error: 'User not found.' });
-  if (target.username === req.user.username && req.body.isAdmin === false) {
-    return res.status(400).json({ error: 'You cannot remove your own admin access.' });
+  // Demotion = isAdmin present and falsy (0, "", null all count, not just false).
+  const demoting = 'isAdmin' in req.body && !req.body.isAdmin;
+  if (demoting && target.isAdmin) {
+    if (target.username === req.user.username) {
+      return res.status(400).json({ error: 'You cannot remove your own admin access.' });
+    }
+    if (listUsers().filter(u => u.isAdmin).length <= 1) {
+      return res.status(400).json({ error: 'Cannot remove the last administrator.' });
+    }
   }
   try {
     updateUser(target.username, req.body);

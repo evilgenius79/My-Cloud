@@ -10,7 +10,7 @@ import { userDirs } from './auth.js';
 import { withLock } from './locks.js';
 import {
   safeJoin, validName, listDir, dirSize, uniqueName,
-  copyRecursive, moveEntry, searchFiles, statEntry
+  copyRecursive, moveEntry, searchFiles, statEntry, realContained
 } from './fsutil.js';
 
 const MAX_UPLOAD_FILES = 10000;
@@ -74,11 +74,25 @@ export function sendFile(req, res, abs, { download = false, name = null } = {}) 
   fs.createReadStream(abs).pipe(res);
 }
 
-export function sendZip(res, abs, zipName) {
+// Cap simultaneous on-the-fly zip streams so a burst (especially on public
+// shares) can't pin every CPU. Public callers pass a lower compression level.
+let activeZips = 0;
+const MAX_ACTIVE_ZIPS = 4;
+
+export function sendZip(res, abs, zipName, { level = 1 } = {}) {
+  if (activeZips >= MAX_ACTIVE_ZIPS) {
+    res.setHeader('Retry-After', '5');
+    return res.status(503).json({ error: 'Server busy compressing other downloads. Try again shortly.' });
+  }
+  activeZips++;
+  let finished = false;
+  const done = () => { if (finished) return; finished = true; activeZips = Math.max(0, activeZips - 1); };
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}`);
-  const archive = archiver('zip', { zlib: { level: 1 } });
-  archive.on('error', () => res.destroy());
+  const archive = archiver('zip', { zlib: { level } });
+  archive.on('error', () => { done(); res.destroy(); });
+  archive.on('end', done);
+  res.on('close', done);
   archive.pipe(res);
   archive.directory(abs, path.basename(abs));
   archive.finalize();
@@ -92,7 +106,10 @@ filesRouter.get('/list', wrap(async (req, res) => {
 }));
 
 filesRouter.get('/download', wrap(async (req, res) => {
-  const abs = safeJoin(root(req), req.query.path);
+  const filesRoot = root(req);
+  const abs = safeJoin(filesRoot, req.query.path);
+  // Reject symlinks that resolve outside the user's root (planted out-of-band).
+  if (!await realContained(filesRoot, abs)) return res.status(404).json({ error: 'Not found.' });
   const st = await fsp.stat(abs);
   if (st.isDirectory()) return sendZip(res, abs, path.basename(abs) + '.zip');
   sendFile(req, res, abs, { download: req.query.dl !== '0' });
@@ -120,117 +137,147 @@ filesRouter.post('/zip', wrap(async (req, res) => {
   archive.finalize();
 }));
 
+// Total on-disk footprint for a user: files AND trash. Counting trash stops a
+// fill -> delete -> fill loop from bypassing quota while bytes still occupy disk.
+export async function usedBytes(username) {
+  const d = userDirs(username);
+  const [f, t] = await Promise.all([dirSize(d.files), dirSize(d.trash).catch(() => 0)]);
+  return f + t;
+}
+
 async function quotaRemaining(req) {
   const quotaMB = req.user.quotaMB || 0;
   if (!quotaMB) return Infinity;
-  const used = await dirSize(root(req));
-  return quotaMB * 1024 * 1024 - used;
+  return quotaMB * 1024 * 1024 - await usedBytes(req.user.username);
 }
 
-filesRouter.post('/upload', wrap(async (req, res) => {
-  const filesRoot = root(req);
-  const destDir = safeJoin(filesRoot, req.query.path);
-  const st = await fsp.stat(destDir).catch(() => null);
-  if (!st || !st.isDirectory()) return res.status(400).json({ error: 'Destination folder not found.' });
+export function isMultipart(req) {
+  return /multipart\/form-data/i.test(req.headers['content-type'] || '');
+}
 
-  const quotaBytes = (req.user.quotaMB || 0) * 1024 * 1024; // 0 = unlimited
-  // Serialize per user so concurrent uploads can't each see the full free
-  // quota and collectively exceed it.
-  await withLock('quota:' + req.user.username, () => new Promise(resolve => {
+// Shared, robust multipart receiver used by both the authenticated upload and
+// the public drop-box. ALWAYS resolves its promise (even on a Busboy throw) so
+// the per-user quota lock can never be wedged. Enforces the owner's quota and
+// an absolute byte cap, cleans up every temp file on any exit path.
+export function streamUpload(req, res, {
+  username, destDir, allowSubdirs, quotaBytes, maxBytes = Infinity, outOfSpaceMsg = 'Storage quota exceeded.'
+}) {
+  return new Promise(resolve => {
     let usedStart = 0;
-    let projected = 0;      // committed + in-flight bytes this request
+    let projected = 0;
     let quotaExceeded = false;
     let tooMany = false;
     let fileCount = 0;
     let responded = false;
     const saved = [];
     const pending = [];
-    const open = new Set(); // { out, tmp } records still writing, for abort cleanup
+    const open = new Set(); // rec = { out, tmp, aborted }
 
-    const respond = () => {
+    const wipe = () => {
+      for (const rec of open) {
+        rec.aborted = true;
+        try { rec.out.destroy(); } catch { /* ignore */ }
+        fs.rm(rec.tmp, { force: true }, () => {});
+      }
+      open.clear();
+    };
+    const respond = (status, body) => {
       if (responded) return;
       responded = true;
-      if (quotaExceeded) res.status(413).json({ error: 'Storage quota exceeded.', saved });
-      else if (tooMany) res.status(413).json({ error: 'Too many files in one upload.', saved });
-      else res.json({ saved });
+      res.status(status).json(body);
       resolve();
     };
+    const finish = () => {
+      if (quotaExceeded) return respond(413, { error: outOfSpaceMsg, saved });
+      if (tooMany) return respond(413, { error: 'Too many files in one upload.', saved });
+      respond(200, { saved });
+    };
+    const cap = Math.min(quotaBytes || Infinity, maxBytes);
 
-    dirSize(filesRoot).catch(() => 0).then(used => {
+    // Compute starting usage only when a limit actually applies.
+    const usagePromise = cap === Infinity ? Promise.resolve(0) : usedBytes(username).catch(() => 0);
+    usagePromise.then(used => {
       usedStart = used || 0;
-      const busboy = Busboy({ headers: req.headers });
+      let busboy;
+      try {
+        // preservePath keeps subfolder paths in the filename (e.g. folder
+        // uploads) — busboy strips to basename otherwise. Traversal is still
+        // blocked by the '.'/'..' filter, validName, and safeJoin below.
+        busboy = Busboy({ headers: req.headers, preservePath: true, limits: { files: MAX_UPLOAD_FILES + 1 } });
+      } catch {
+        // Malformed Content-Type / missing boundary throws here — must still
+        // resolve the lock and answer the client.
+        return respond(400, { error: 'Expected a valid multipart upload.' });
+      }
 
       busboy.on('file', (field, stream, info) => {
         pending.push(new Promise(doneFile => {
-          let rec = null;
-          let fileAborted = false;
-          const cleanup = () => { if (rec) { open.delete(rec); rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); } };
+          const rec = { out: null, tmp: null, aborted: false };
+          const drop = () => { open.delete(rec); if (rec.tmp) fs.rm(rec.tmp, { force: true }, () => {}); };
           try {
             if (++fileCount > MAX_UPLOAD_FILES) { tooMany = true; stream.resume(); return doneFile(); }
-            // Client may send files under subfolder-relative names (folder upload).
             const relName = String(info.filename || 'unnamed').replace(/\\/g, '/');
             const parts = relName.split('/').filter(p => p && p !== '.' && p !== '..');
             if (parts.length === 0 || parts.some(p => !validName(p))) { stream.resume(); return doneFile(); }
             const fileName = parts.pop();
-            const dir = parts.length ? safeJoin(destDir, parts.join('/')) : destDir;
+            const dir = (allowSubdirs && parts.length) ? safeJoin(destDir, parts.join('/')) : destDir;
             fs.mkdirSync(dir, { recursive: true });
-            const tmp = path.join(dir, '.' + crypto.randomBytes(8).toString('hex') + '.uploading');
-            const out = fs.createWriteStream(tmp);
-            rec = { out, tmp };
+            rec.tmp = path.join(dir, '.' + crypto.randomBytes(8).toString('hex') + '.uploading');
+            rec.out = fs.createWriteStream(rec.tmp);
             open.add(rec);
 
             stream.on('data', chunk => {
               projected += chunk.length;
-              if (quotaBytes && usedStart + projected > quotaBytes) {
+              if (cap !== Infinity && usedStart + projected > cap) {
                 quotaExceeded = true;
-                fileAborted = true;
-                stream.unpipe(out);
-                out.destroy();
+                rec.aborted = true;
+                stream.unpipe(rec.out);
+                rec.out.destroy();
                 stream.resume();
               }
             });
-            out.on('close', () => {
+            rec.out.on('close', () => {
               open.delete(rec);
-              if (fileAborted) { fs.rm(tmp, { force: true }, () => {}); return doneFile(); }
+              if (rec.aborted) { fs.rm(rec.tmp, { force: true }, () => {}); return doneFile(); }
               try {
-                // Pick a free name now, at commit time, so two same-named files
-                // in one request don't clobber each other.
                 const finalName = uniqueName(dir, fileName);
-                fs.renameSync(tmp, path.join(dir, finalName));
-                saved.push(parts.length ? parts.join('/') + '/' + finalName : finalName);
-              } catch { fs.rm(tmp, { force: true }, () => {}); }
+                fs.renameSync(rec.tmp, path.join(dir, finalName));
+                saved.push((allowSubdirs && parts.length) ? parts.join('/') + '/' + finalName : finalName);
+              } catch { fs.rm(rec.tmp, { force: true }, () => {}); }
               doneFile();
             });
-            out.on('error', () => { cleanup(); doneFile(); });
-            stream.on('error', () => { fileAborted = true; doneFile(); });
-            stream.pipe(out);
+            rec.out.on('error', () => { drop(); doneFile(); });
+            // Source error: mark aborted and tear down so no partial file commits.
+            stream.on('error', () => { rec.aborted = true; try { rec.out.destroy(); } catch { /* ignore */ } drop(); doneFile(); });
+            stream.pipe(rec.out);
           } catch {
-            // Any synchronous failure (mkdir on a name collision, createWriteStream,
-            // safeJoin) is contained here instead of crashing the whole process.
-            fileAborted = true;
-            cleanup();
+            // Any synchronous failure is contained here, never crashing the process.
+            rec.aborted = true;
+            drop();
             stream.resume();
             doneFile();
           }
         }));
       });
 
-      busboy.on('close', async () => {
-        await Promise.all(pending);
-        respond();
-      });
-      busboy.on('error', () => {
-        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); }
-        if (!responded) { responded = true; res.status(400).json({ error: 'Upload failed.' }); resolve(); }
-      });
-      // Client aborted the connection mid-upload: drop the temp files.
-      req.on('aborted', () => {
-        for (const rec of open) { try { rec.out.destroy(); } catch { /* ignore */ } rec.tmp && fs.rm(rec.tmp, { force: true }, () => {}); }
-        if (!responded) { responded = true; resolve(); }
-      });
-      req.pipe(busboy);
-    });
-  }));
+      busboy.on('close', async () => { await Promise.all(pending); finish(); });
+      busboy.on('error', () => { wipe(); respond(400, { error: 'Upload failed.' }); });
+      req.on('aborted', () => { wipe(); if (!responded) { responded = true; resolve(); } });
+      try { req.pipe(busboy); } catch { wipe(); respond(400, { error: 'Upload failed.' }); }
+    }).catch(() => { wipe(); if (!responded) { responded = true; try { res.sendStatus(500); } catch { /* ignore */ } resolve(); } });
+  });
+}
+
+filesRouter.post('/upload', wrap(async (req, res) => {
+  if (!isMultipart(req)) return res.status(400).json({ error: 'Expected a multipart upload.' });
+  const filesRoot = root(req);
+  const destDir = safeJoin(filesRoot, req.query.path);
+  const st = await fsp.stat(destDir).catch(() => null);
+  if (!st || !st.isDirectory()) return res.status(400).json({ error: 'Destination folder not found.' });
+  const quotaBytes = (req.user.quotaMB || 0) * 1024 * 1024; // 0 = unlimited
+  // Serialize per user so concurrent uploads can't collectively exceed quota.
+  await withLock('quota:' + req.user.username, () =>
+    streamUpload(req, res, { username: req.user.username, destDir, allowSubdirs: true, quotaBytes }));
 }));
 
 filesRouter.post('/mkdir', wrap(async (req, res) => {
@@ -348,7 +395,7 @@ filesRouter.get('/search', wrap(async (req, res) => {
 }));
 
 filesRouter.get('/usage', wrap(async (req, res) => {
-  const used = await dirSize(root(req));
+  const used = await usedBytes(req.user.username);
   res.json({ used, quotaMB: req.user.quotaMB || 0 });
 }));
 
@@ -378,8 +425,13 @@ filesRouter.put('/content', express.text({ limit: '6mb', type: '*/*' }), wrap(as
     if (delta > remaining) return res.status(413).json({ error: 'Storage quota exceeded.' });
     // Atomic write so a crash mid-save can't truncate the user's file.
     const tmp = abs + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
-    await fsp.writeFile(tmp, body);
-    await fsp.rename(tmp, abs);
+    try {
+      await fsp.writeFile(tmp, body);
+      await fsp.rename(tmp, abs);
+    } catch (err) {
+      await fsp.rm(tmp, { force: true });
+      throw err;
+    }
     res.json({ ok: true });
   });
 }));

@@ -11,12 +11,20 @@ fs.mkdirSync(path.join(DATA_DIR, 'users'), { recursive: true });
 
 // Session-signing secret persists across restarts so logins survive updates.
 const secretFile = path.join(CONFIG_DIR, 'secret.key');
-let secret;
-if (fs.existsSync(secretFile)) {
-  secret = fs.readFileSync(secretFile, 'utf8').trim();
-} else {
+function writeSecretAtomically(value) {
+  const tmp = secretFile + '.tmp';
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  fs.writeSync(fd, value);
+  fs.fsyncSync(fd); // flush before rename so a crash can't leave a partial key
+  fs.closeSync(fd);
+  fs.renameSync(tmp, secretFile);
+}
+let secret = fs.existsSync(secretFile) ? fs.readFileSync(secretFile, 'utf8').trim() : '';
+// Regenerate if missing, empty, or suspiciously short (e.g. a truncated write
+// from an interrupted first boot) — an empty key would make tokens forgeable.
+if (secret.length < 32) {
   secret = crypto.randomBytes(48).toString('hex');
-  fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+  writeSecretAtomically(secret);
 }
 
 const settingsFile = path.join(CONFIG_DIR, 'settings.json');

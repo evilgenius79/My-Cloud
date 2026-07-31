@@ -21,4 +21,7 @@
   <Config Name="WebUI Port" Target="8686" Default="8686" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8686</Config>
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/my-cloud" Mode="rw" Description="App settings, users and share links (small JSON files)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/my-cloud</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/my-cloud" Mode="rw" Description="Where user files are stored (users/&lt;username&gt;/files)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/my-cloud</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns created files (Unraid default: 99 = nobody)" Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns created files (Unraid default: 100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="Permission umask for created files" Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
 </Container>
