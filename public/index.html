@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My Cloud</title>
+<script>try { var t = localStorage.getItem('mycloud_theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234f8ff7' d='M6.5 20a5.5 5.5 0 0 1-.44-10.98A7 7 0 0 1 19.5 11a4.5 4.5 0 0 1-.5 8.97z'/%3E%3C/svg%3E">
 </head>
@@ -42,6 +43,7 @@
         </div>
         <div class="user-row">
           <span id="user-name" class="user-name"></span>
+          <button id="btn-theme" class="icon-btn" title="Theme: auto">🌓</button>
           <button id="btn-account" class="icon-btn" title="Account">⚙️</button>
           <button id="btn-logout" class="icon-btn" title="Sign out">⏻</button>
         </div>

@@ -1192,6 +1192,29 @@ $('settings-form').addEventListener('submit', async e => {
   }
 });
 
+// ---------- Theme toggle: auto -> dark -> light ----------
+const THEME_ICONS = { auto: '🌓', dark: '🌙', light: '☀️' };
+function applyTheme(mode) {
+  if (mode === 'auto') {
+    delete document.documentElement.dataset.theme;
+    localStorage.removeItem('mycloud_theme');
+  } else {
+    document.documentElement.dataset.theme = mode;
+    localStorage.setItem('mycloud_theme', mode);
+  }
+  const btn = $('btn-theme');
+  btn.textContent = THEME_ICONS[mode];
+  btn.title = 'Theme: ' + mode;
+}
+applyTheme(localStorage.getItem('mycloud_theme') || 'auto');
+$('btn-theme').addEventListener('click', () => {
+  const order = ['auto', 'dark', 'light'];
+  const current = localStorage.getItem('mycloud_theme') || 'auto';
+  const next = order[(order.indexOf(current) + 1) % order.length];
+  applyTheme(next);
+  toast('Theme: ' + (next === 'auto' ? 'auto (follows your device)' : next));
+});
+
 // ---------- Account (change password) ----------
 $('btn-account').addEventListener('click', () => {
   const cur = document.createElement('input');

@@ -11,8 +11,9 @@
   --shadow: 0 4px 24px rgba(20, 30, 60, .10);
   --radius: 10px;
 }
+/* Auto dark: follow the OS unless the user forced light in-app. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #12151c;
     --panel: #1a1f2a;
     --panel-2: #232a38;
@@ -24,6 +25,19 @@
     --border: #2c3444;
     --shadow: 0 4px 24px rgba(0, 0, 0, .4);
   }
+}
+/* Forced dark via the in-app toggle. */
+:root[data-theme="dark"] {
+  --bg: #12151c;
+  --panel: #1a1f2a;
+  --panel-2: #232a38;
+  --text: #e7ebf3;
+  --muted: #8b93a5;
+  --accent: #5b96f5;
+  --accent-hover: #78aaf8;
+  --danger: #ef6a63;
+  --border: #2c3444;
+  --shadow: 0 4px 24px rgba(0, 0, 0, .4);
 }
 
 * { box-sizing: border-box; }
